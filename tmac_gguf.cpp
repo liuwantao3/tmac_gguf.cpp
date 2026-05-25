@@ -1693,7 +1693,7 @@ int main(int argc, char** argv) {
         printf("  --metal:      Use Metal GPU acceleration with per-layer sync\n");
         printf("  --metal-fused: Use Metal GPU with single-command-buffer fused path (implies --metal)\n");
         printf("  --perf:       Enable pipeline profiling (Chrome trace JSON + bottleneck analysis)\n");
-        printf("  --gpu-capture: Wait for Xcode GPU frame capture attach before generate loop\n");
+        printf("  --gpu-capture: Capture GPU trace to /tmp/capture.gputrace\n");
         printf("  --dump-tiles N: Dump first N Q8 tiles for Verilog cosimulation\n");
         return 1;
     }
@@ -1760,24 +1760,28 @@ int main(int argc, char** argv) {
 
     if (generate_n > 0) {
         if (g_gpu_capture) {
-            printf("[GPU CAPTURE] PID=%d\n", getpid());
-            printf("  1. Open Xcode\n");
-            printf("  2. Debug -> Attach to Process -> %d\n", getpid());
-            printf("  3. Click the Metal debugger camera icon\n");
-            printf("  4. Press Enter in THIS terminal to start inference\n");
+            printf("[GPU CAPTURE] Attach Xcode: Debug -> Attach to Process -> tmac_gguf\n");
+            printf("  Then press Enter in this terminal...\n");
             fflush(stdout);
             for (;;) {
                 FILE* tty = fopen("/dev/tty", "r");
                 if (tty) {
-                    int c = getc(tty);
-                    fclose(tty);
-                    if (c != EOF) break; // got actual input
-                    // EOF = no controlling terminal; retry
+                    int c = getc(tty); fclose(tty);
+                    if (c != EOF) break;
                 }
+                sleep(1);
+            }
+            for (int tries = 0; tries < 30; tries++) {
+                if (metal_backend::capture_start(g_mtl_ctx)) break;
+                printf("  Waiting for Xcode to attach...\n");
                 sleep(1);
             }
         }
         generate(hidden, logits, (int)tokens.size(), generate_n, 40);
+        if (g_gpu_capture) {
+            metal_backend::capture_stop();
+            printf("[GPU CAPTURE] Done. Check Xcode for the captured frame.\n");
+        }
     } else {
         if (g_fpga_q8) {
             get_logits_q8(logits, hidden);

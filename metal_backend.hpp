@@ -515,6 +515,21 @@ inline bool init(Context& ctx) {
 
 inline void shutdown(Context& ctx) { ctx.initialized = false; }
 
+// ── GPU trace capture (writes .gputrace for Metal Debugger/Instruments) ──
+inline bool capture_start(Context& ctx) {
+    MTLCaptureManager* mgr = [MTLCaptureManager sharedCaptureManager];
+    if (![mgr supportsDestination:MTLCaptureDestinationDeveloperTools]) return false;
+    MTLCaptureDescriptor* desc = [[MTLCaptureDescriptor alloc] init];
+    desc.captureObject = ctx.device;
+    desc.destination = MTLCaptureDestinationDeveloperTools;
+    NSError* err;
+    return [mgr startCaptureWithDescriptor:desc error:&err];
+}
+
+inline void capture_stop() {
+    [[MTLCaptureManager sharedCaptureManager] stopCapture];
+}
+
 // ── Dispatch helpers (batch-based, no per-call commit/wait) ──
 
 inline void matmul_q8_0(Context& ctx, int rows, int cols,
