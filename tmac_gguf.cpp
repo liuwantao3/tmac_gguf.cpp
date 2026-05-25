@@ -1646,9 +1646,7 @@ void generate(float* hidden, float* logits, int prompt_len, int n_tokens, int to
     if (!emb_t) return;
 
     // Bootstrap: logits from prefill-processed hidden → predicts first gen token
-    if (g_use_metal_fused) {
-        get_logits(logits, hidden);
-    }
+    get_logits(logits, hidden);
 
     for (int gen = 0; gen < n_tokens; gen++) {
         int pos = prompt_len + gen;
