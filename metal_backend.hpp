@@ -136,11 +136,11 @@ inline void metal_batch_dispatch(
     [g_batch_enc setBuffer:g_params_buf offset:slot atIndex:3];
 
     if (is_simd) {
-        int total = ((rows + 15) / 16) * 256;
+        int total = ((rows + 3) / 4) * 64;
         [g_batch_enc dispatchThreads:MTLSizeMake(total, 1, 1)
-         threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+         threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
     } else {
-        int tg = std::min(rows, 256);
+        int tg = std::min(rows, 64);
         [g_batch_enc dispatchThreads:MTLSizeMake(rows, 1, 1)
          threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
     }
@@ -166,7 +166,7 @@ kernel void mul_mat_fp32(device const float* A [[buffer(0)]],
     y[gid] = sum;
 }
 
-// ── Q8_0 (SIMD, 256-thread threadgroup, 8 SIMD groups × 2 rows) ──
+// ── Q8_0 (SIMD, 64-thread threadgroup, 2 SIMD groups × 2 rows) ──
 // Block: [half scale][int8×32] = 34 bytes per 32 values
 kernel void mul_mat_q8_0(device const uint8_t* W [[buffer(0)]],
                          device const float* x [[buffer(1)]],
@@ -176,9 +176,9 @@ kernel void mul_mat_q8_0(device const uint8_t* W [[buffer(0)]],
     int rows = params[0], cols = params[1];
     int nb = cols / 32;
     int lane = gid % 32;
-    int sg = (gid / 32) % 8;
-    int tgpig = gid / 256;
-    int first_row = tgpig * 16 + sg * 2;
+    int sg = (gid / 32) % 2;
+    int tgpig = gid / 64;
+    int first_row = tgpig * 4 + sg * 2;
     if (first_row >= rows) return;
     int nr = min(2, rows - first_row);
     float sumf[2] = {0.f, 0.f};
@@ -197,7 +197,7 @@ kernel void mul_mat_q8_0(device const uint8_t* W [[buffer(0)]],
     }
 }
 
-// ── Q5_0 (SIMD, 256-thread threadgroup, 8 SIMD groups × 2 rows) ──
+// ── Q5_0 (SIMD, 64-thread threadgroup, 2 SIMD groups × 2 rows) ──
 // Each lane handles 1 element per 32-element block
 kernel void mul_mat_q5_0(device const uint8_t* W [[buffer(0)]],
                          device const float* x [[buffer(1)]],
@@ -207,9 +207,9 @@ kernel void mul_mat_q5_0(device const uint8_t* W [[buffer(0)]],
     int rows = params[0], cols = params[1];
     int nb = cols / 32;
     int lane = gid % 32;
-    int sg = (gid / 32) % 8;
-    int tgpig = gid / 256;
-    int first_row = tgpig * 16 + sg * 2;
+    int sg = (gid / 32) % 2;
+    int tgpig = gid / 64;
+    int first_row = tgpig * 4 + sg * 2;
     if (first_row >= rows) return;
     int nr = min(2, rows - first_row);
     float sumf[2] = {0.f, 0.f};
@@ -233,7 +233,7 @@ kernel void mul_mat_q5_0(device const uint8_t* W [[buffer(0)]],
     }
 }
 
-// ── Q4_K (SIMD, 256-thread threadgroup, 8 SIMD groups × 2 rows) ──
+// ── Q4_K (SIMD, 64-thread threadgroup, 2 SIMD groups × 2 rows) ──
 // Each lane handles 8 elements per 256-element block
 kernel void mul_mat_q4_k(device const uint8_t* W [[buffer(0)]],
                          device const float* x [[buffer(1)]],
@@ -243,9 +243,9 @@ kernel void mul_mat_q4_k(device const uint8_t* W [[buffer(0)]],
     int rows = params[0], cols = params[1];
     int nb = (cols + 255) / 256;
     int lane = gid % 32;
-    int sg = (gid / 32) % 8;
-    int tgpig = gid / 256;
-    int first_row = tgpig * 16 + sg * 2;
+    int sg = (gid / 32) % 2;
+    int tgpig = gid / 64;
+    int first_row = tgpig * 4 + sg * 2;
     if (first_row >= rows) return;
     int nr = min(2, rows - first_row);
     uint pos = lane * 8;
@@ -291,7 +291,7 @@ kernel void mul_mat_q4_k(device const uint8_t* W [[buffer(0)]],
     }
 }
 
-// ── Q6_K (SIMD, 256-thread threadgroup, 8 SIMD groups × 2 rows) ──
+// ── Q6_K (SIMD, 64-thread threadgroup, 2 SIMD groups × 2 rows) ──
 // Each lane handles 8 elements per 256-element block
 kernel void mul_mat_q6_k(device const uint8_t* W [[buffer(0)]],
                          device const float* x [[buffer(1)]],
@@ -301,9 +301,9 @@ kernel void mul_mat_q6_k(device const uint8_t* W [[buffer(0)]],
     int rows = params[0], cols = params[1];
     int nb = (cols + 255) / 256;
     int lane = gid % 32;
-    int sg = (gid / 32) % 8;
-    int tgpig = gid / 256;
-    int first_row = tgpig * 16 + sg * 2;
+    int sg = (gid / 32) % 2;
+    int tgpig = gid / 64;
+    int first_row = tgpig * 4 + sg * 2;
     if (first_row >= rows) return;
     int nr = min(2, rows - first_row);
     uint pos = lane * 8;
@@ -562,9 +562,9 @@ inline void elem_op(Context& ctx, int op, float* data, const float* aux, int dim
     [g_batch_enc setBuffer:buf_d offset:0 atIndex:0];
     [g_batch_enc setBuffer:buf_a offset:0 atIndex:1];
     [g_batch_enc setBuffer:g_params_buf offset:slot atIndex:2];
-    int total = ((dim + 255) / 256) * 256;
+    int total = ((dim + 63) / 64) * 64;
     [g_batch_enc dispatchThreads:MTLSizeMake(total, 1, 1)
-     threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+     threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
 }
 
 inline void rope_op(Context& ctx, float* data, int n_heads, int head_dim, int pos, float base) {
@@ -576,9 +576,9 @@ inline void rope_op(Context& ctx, float* data, int n_heads, int head_dim, int po
     memcpy(&pp[3], &base, 4);
     [g_batch_enc setBuffer:buf_d offset:0 atIndex:0];
     [g_batch_enc setBuffer:g_params_buf offset:slot atIndex:2];
-    int total = n_heads * head_dim / 2;
+    int total = ((n_heads * head_dim / 2 + 63) / 64) * 64;
     [g_batch_enc dispatchThreads:MTLSizeMake(total, 1, 1)
-     threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+     threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
 }
 
 inline void rmsnorm_op(Context& ctx, float* data, const float* weight, int dim) {
