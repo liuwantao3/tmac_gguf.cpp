@@ -24,7 +24,9 @@ struct Context {
     id<MTLComputePipelineState> pipe_q5_0 = nil;
     id<MTLComputePipelineState> pipe_q4_k = nil;
     id<MTLComputePipelineState> pipe_q6_k = nil;
-    id<MTLComputePipelineState> pipe_elem = nil;
+    id<MTLComputePipelineState> pipe_elem_add = nil;
+    id<MTLComputePipelineState> pipe_elem_silu = nil;
+    id<MTLComputePipelineState> pipe_elem_write = nil;
     id<MTLComputePipelineState> pipe_rope = nil;
     id<MTLComputePipelineState> pipe_attn = nil;
     id<MTLComputePipelineState> pipe_rmsnorm = nil;
@@ -344,20 +346,21 @@ kernel void mul_mat_q6_k(device const uint8_t* W [[buffer(0)]],
 // ── Fused-pipeline kernels ──
 //
 
-// Element-wise: op=0 add, op=1 silu_x_up, op=2 cache_write
+// Element-wise: specialized via function constant kernel_op
+// 0 = add, 1 = silu_x_up, 2 = cache_write
+constant int kernel_op [[function_constant(0)]];
 kernel void kernel_elem(device float* data [[buffer(0)]],
                          device const float* aux [[buffer(1)]],
                          constant int* params [[buffer(2)]],
                          uint gid [[thread_position_in_grid]]) {
-    int op = params[0];
-    int dim = params[1];
+    int dim = params[0];
     if (gid >= (uint)dim) return;
-    if (op == 0) {
+    if (kernel_op == 0) {
         data[gid] += aux[gid];
-    } else if (op == 1) {
+    } else if (kernel_op == 1) {
         float x = data[gid];
         data[gid] = (x / (1 + exp(-x))) * data[gid + dim];
-    } else if (op == 2) {
+    } else if (kernel_op == 2) {
         data[gid] = aux[gid];
     }
 }
@@ -484,11 +487,24 @@ inline bool init(Context& ctx) {
     ctx.pipe_q6_k = get_pipe("mul_mat_q6_k");
     if (!ctx.pipe_q5_0 || !ctx.pipe_q4_k || !ctx.pipe_q6_k) return false;
 
-    ctx.pipe_elem = get_pipe("kernel_elem");
+    {
+        MTLFunctionConstantValues* cv = [MTLFunctionConstantValues new];
+        auto make_pipe = [&](int op_val) -> id<MTLComputePipelineState> {
+            [cv setConstantValue:&op_val type:MTLDataTypeInt atIndex:0];
+            id<MTLFunction> fn = [ctx.library newFunctionWithName:@"kernel_elem"
+                                   constantValues:cv error:&err];
+            if (err) return nil;
+            return [ctx.device newComputePipelineStateWithFunction:fn error:&err];
+        };
+        ctx.pipe_elem_add  = make_pipe(0);
+        ctx.pipe_elem_silu = make_pipe(1);
+        ctx.pipe_elem_write = make_pipe(2);
+        if (!ctx.pipe_elem_add || !ctx.pipe_elem_silu || !ctx.pipe_elem_write) return false;
+    }
     ctx.pipe_rope = get_pipe("kernel_rope");
     ctx.pipe_attn = get_pipe("kernel_attn");
     ctx.pipe_rmsnorm = get_pipe("kernel_rmsnorm");
-    if (!ctx.pipe_elem || !ctx.pipe_rope || !ctx.pipe_attn || !ctx.pipe_rmsnorm) return false;
+    if (!ctx.pipe_rope || !ctx.pipe_attn || !ctx.pipe_rmsnorm) return false;
 
     ctx.initialized = true;
     printf("[METAL] Device: %s\n", [[ctx.device name] UTF8String]);
@@ -527,7 +543,11 @@ inline void matmul_q6_k(Context& ctx, int rows, int cols,
 // ── Fused-kernel dispatch helpers ──
 
 inline void elem_op(Context& ctx, int op, float* data, const float* aux, int dim) {
-    metal_batch_ensure_encoder(ctx, ctx.pipe_elem);
+    id<MTLComputePipelineState> pipe;
+    if (op == 0) pipe = ctx.pipe_elem_add;
+    else if (op == 1) pipe = ctx.pipe_elem_silu;
+    else pipe = ctx.pipe_elem_write;
+    metal_batch_ensure_encoder(ctx, pipe);
     id<MTLBuffer> buf_d = wrap_buffer(ctx, data, (size_t)(op == 1 ? 2 : 1) * dim * 4);
     id<MTLBuffer> buf_a;
     if (op == 1 || !aux) {
@@ -535,9 +555,9 @@ inline void elem_op(Context& ctx, int op, float* data, const float* aux, int dim
     } else {
         buf_a = wrap_buffer(ctx, aux, (size_t)dim * 4);
     }
-    int slot = g_params_offset; g_params_offset += 8;
+    int slot = g_params_offset; g_params_offset += 4;
     int* pp = (int*)((uint8_t*)[g_params_buf contents] + slot);
-    pp[0] = op; pp[1] = dim;
+    pp[0] = dim;
     [g_batch_enc setBuffer:buf_d offset:0 atIndex:0];
     [g_batch_enc setBuffer:buf_a offset:0 atIndex:1];
     [g_batch_enc setBuffer:g_params_buf offset:slot atIndex:2];
