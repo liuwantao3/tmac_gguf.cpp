@@ -1,0 +1,27 @@
+# Compiled binaries
+tmac_gguf
+tmac_gguf_256
+test_metal
+test_metal_demo
+test_metal_full
+test_mem
+list_types
+
+# Object files
+*.o
+*.obj
+*.dSYM
+
+# IDE
+.vscode/
+
+# Model weights (binary, large)
+models/
+*.tmac
+
+# Trace output
+/tmp/pipeline_trace.json
+/tmp/cosim_tiles.bin
+
+# macOS
+.DS_Store
