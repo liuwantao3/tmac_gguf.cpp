@@ -179,6 +179,7 @@ static bool g_use_fpga = false;
 static bool g_fpga_q8 = false;
 static bool g_fpga_q4k = false;
 static bool g_use_metal = false;
+static bool g_gpu_capture = false;
 static bool g_use_metal_fused = false;
 static metal_backend::Context g_mtl_ctx;
 
@@ -1692,6 +1693,7 @@ int main(int argc, char** argv) {
         printf("  --metal:      Use Metal GPU acceleration with per-layer sync\n");
         printf("  --metal-fused: Use Metal GPU with single-command-buffer fused path (implies --metal)\n");
         printf("  --perf:       Enable pipeline profiling (Chrome trace JSON + bottleneck analysis)\n");
+        printf("  --gpu-capture: Wait for Xcode GPU frame capture attach before generate loop\n");
         printf("  --dump-tiles N: Dump first N Q8 tiles for Verilog cosimulation\n");
         return 1;
     }
@@ -1716,6 +1718,7 @@ int main(int argc, char** argv) {
         if (strcmp(argv[i], "--fpga-q8") == 0) { g_use_fpga = true; g_fpga_q8 = true; }
         if (strcmp(argv[i], "--fpga-q4k") == 0) { g_use_fpga = true; g_fpga_q4k = true; }
         if (strcmp(argv[i], "--perf") == 0) g_perf_enabled = true;
+        if (strcmp(argv[i], "--gpu-capture") == 0) g_gpu_capture = true;
         if (strcmp(argv[i], "--dump-tiles") == 0 && i + 1 < argc) {
             int n = atoi(argv[++i]);
             if (n > 0) {
@@ -1756,6 +1759,16 @@ int main(int argc, char** argv) {
     }
 
     if (generate_n > 0) {
+        if (g_gpu_capture) {
+            printf("[GPU CAPTURE] Attach Xcode now (Debug → Attach to Process → %s)\n",
+                   argv[0]);
+            printf("              Then click the Metal debugger camera icon.\n");
+            printf("              Press Enter in this terminal to start inference...\n");
+            fflush(stdout);
+            FILE* tty = fopen("/dev/tty", "r");
+            if (tty) { getc(tty); fclose(tty); }
+            else { printf("(no tty, continuing in 5s)\n"); sleep(5); }
+        }
         generate(hidden, logits, (int)tokens.size(), generate_n, 40);
     } else {
         if (g_fpga_q8) {
