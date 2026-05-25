@@ -1,11 +1,15 @@
 # Compiled binaries
 tmac_gguf
 tmac_gguf_256
+tmac_gguf_flash
 test_metal
 test_metal_demo
 test_metal_full
 test_mem
 list_types
+
+# Symlink to external fpga_sim.hpp
+fpga_sim.hpp
 
 # Object files
 *.o

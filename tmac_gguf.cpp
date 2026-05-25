@@ -1533,11 +1533,17 @@ void forward_and_logits_fused(float* hidden, float* logits, int pos) {
         metal_backend::g_trace_name = "attn_rms";    metal_backend::rmsnorm_op(g_mtl_ctx, scratch,
             (const float*)get_tensor_info(name)->data, HIDDEN_DIM);
         snprintf(name, 128, "blk.%d.attn_q.weight", layer);
-        metal_backend::g_trace_name = "attn_q";      matmul(get_tensor_info(name), scratch, q_vec, HIDDEN_DIM, HIDDEN_DIM);
+        snprintf(name, 128, "blk.%d.attn_q.weight", layer);
+        Tensor* t_q = get_tensor_info(name);
         snprintf(name, 128, "blk.%d.attn_k.weight", layer);
-        metal_backend::g_trace_name = "attn_k";      matmul(get_tensor_info(name), scratch, k_new, K_DIM, HIDDEN_DIM);
+        Tensor* t_k = get_tensor_info(name);
         snprintf(name, 128, "blk.%d.attn_v.weight", layer);
-        metal_backend::g_trace_name = "attn_v";      matmul(get_tensor_info(name), scratch, v_new, V_DIM, HIDDEN_DIM);
+        Tensor* t_v = get_tensor_info(name);
+        metal_backend::g_trace_name = "fused_qkv";
+        metal_backend::fused_qkv_op(g_mtl_ctx,
+            t_q->data, t_k->data, t_v->data,
+            scratch, q_vec, k_new, v_new,
+            HIDDEN_DIM, K_DIM, V_DIM, HIDDEN_DIM, t_v->type == TENSOR_Q8_0);
         snprintf(name, 128, "blk.%d.attn_q.bias", layer);
         Tensor* t = get_tensor_info(name);
         metal_backend::g_trace_name = "q_bias";      if (t) metal_backend::elem_op(g_mtl_ctx, 0, q_vec, (const float*)t->data, HIDDEN_DIM);
@@ -1562,7 +1568,6 @@ void forward_and_logits_fused(float* hidden, float* logits, int pos) {
         snprintf(name, 128, "blk.%d.ffn_norm.weight", layer);
         metal_backend::g_trace_name = "ffn_rms";     metal_backend::rmsnorm_op(g_mtl_ctx, scratch,
             (const float*)get_tensor_info(name)->data, HIDDEN_DIM);
-        snprintf(name, 128, "blk.%d.ffn_gate.weight", layer);
         metal_backend::g_trace_name = "ffn_gate";    matmul(get_tensor_info(name), scratch, gate_up, INTER_DIM, HIDDEN_DIM);
         snprintf(name, 128, "blk.%d.ffn_up.weight", layer);
         metal_backend::g_trace_name = "ffn_up";      matmul(get_tensor_info(name), scratch, gate_up + INTER_DIM, INTER_DIM, HIDDEN_DIM);
