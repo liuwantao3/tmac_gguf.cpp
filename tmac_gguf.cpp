@@ -1760,14 +1760,20 @@ int main(int argc, char** argv) {
 
     if (generate_n > 0) {
         if (g_gpu_capture) {
-            printf("[GPU CAPTURE] Attach Xcode now (Debug → Attach to Process → %s)\n",
-                   argv[0]);
-            printf("              Then click the Metal debugger camera icon.\n");
-            printf("              Press Enter in this terminal to start inference...\n");
+            printf("[GPU CAPTURE] PID=%d\n", getpid());
+            printf("  1. Open Xcode\n");
+            printf("  2. Debug -> Attach to Process -> %d\n", getpid());
+            printf("  3. Click the Metal debugger camera icon\n");
+            printf("  4. Press Enter in THIS terminal to start inference\n");
             fflush(stdout);
             for (;;) {
                 FILE* tty = fopen("/dev/tty", "r");
-                if (tty) { getc(tty); fclose(tty); break; }
+                if (tty) {
+                    int c = getc(tty);
+                    fclose(tty);
+                    if (c != EOF) break; // got actual input
+                    // EOF = no controlling terminal; retry
+                }
                 sleep(1);
             }
         }
