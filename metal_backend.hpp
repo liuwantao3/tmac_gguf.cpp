@@ -401,13 +401,13 @@ kernel void kernel_rmsnorm(device float* data [[buffer(0)]],
         data[i] = (data[i] / rms) * weight[i];
 }
 
-// Attention: single-token GQA, 32-thread TG (1 simdgroup), threadgroup scores[past_len+1]
+// Attention: flash-attention single-token GQA, 32-thread TG (1 simdgroup).
+// Processes KV in tiles of 8 with online softmax — single pass, no threadgroup memory, no barriers.
 kernel void kernel_attn(device const float* Q [[buffer(0)]],
                          device const float* K_cache [[buffer(1)]],
                          device const float* V_cache [[buffer(2)]],
                          device float* output [[buffer(3)]],
                          constant int* params [[buffer(4)]],
-                         threadgroup float* scores [[threadgroup(0)]],
                          uint head [[threadgroup_position_in_grid]],
                          ushort lane [[thread_index_in_simdgroup]]) {
     int n_head = params[0];
@@ -418,47 +418,48 @@ kernel void kernel_attn(device const float* Q [[buffer(0)]],
     int kv_head = head / (n_head / n_kv_head);
     int d0 = lane * 2, d1 = lane * 2 + 1;
     if (d0 >= head_dim) return;
-    
+
     float my_q0 = Q[(uint)head * head_dim + d0];
     float my_q1 = Q[(uint)head * head_dim + d1];
     float scale = 1.0 / sqrt((float)head_dim);
-    
-    // Phase 1: scores = Q·K^T / sqrt(head_dim)
-    for (int p = 0; p <= past_len; p++) {
-        ulong cache_ofs = ((ulong)p * n_kv_head + kv_head) * head_dim;
-        float k0 = K_cache[cache_ofs + d0];
-        float k1 = K_cache[cache_ofs + d1];
-        float prod = my_q0 * k0 + my_q1 * k1;
-        float score = simd_sum(prod) * scale;
-        if (lane == 0) scores[p] = score;
+
+    // Flash attention: online softmax, single pass, TILE=8
+    float O0 = 0, O1 = 0, m = -INFINITY, d = 0;
+    int n_pos = past_len + 1;
+
+    for (int tile_start = 0; tile_start < n_pos; tile_start += 8) {
+        int tile_end = min(tile_start + 8, n_pos);
+        int tile_sz = tile_end - tile_start;
+
+        // Compute scores for this tile
+        float s[8];
+        for (int t = 0; t < tile_sz; t++) {
+            int p = tile_start + t;
+            ulong cache_ofs = ((ulong)p * n_kv_head + kv_head) * head_dim;
+            float k0 = K_cache[cache_ofs + d0];
+            float k1 = K_cache[cache_ofs + d1];
+            s[t] = simd_sum(my_q0 * k0 + my_q1 * k1) * scale;
+        }
+
+        // Online softmax: find tile max, rescale previous accum, add new contributions
+        float m_new = m;
+        for (int t = 0; t < tile_sz; t++) m_new = max(m_new, s[t]);
+        float old_scale = exp(m - m_new);
+        O0 *= old_scale; O1 *= old_scale; d *= old_scale;
+
+        for (int t = 0; t < tile_sz; t++) {
+            float e = exp(s[t] - m_new);
+            int p = tile_start + t;
+            ulong cache_ofs = ((ulong)p * n_kv_head + kv_head) * head_dim;
+            O0 += e * V_cache[cache_ofs + d0];
+            O1 += e * V_cache[cache_ofs + d1];
+            d += e;
+        }
+        m = m_new;
     }
-    
-    // Phase 2: online softmax
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    float my_max = -INFINITY;
-    for (int p = lane; p <= past_len; p += 32)
-        my_max = max(my_max, scores[p]);
-    float global_max = simd_max(my_max);
-    float my_sum = 0;
-    for (int p = lane; p <= past_len; p += 32) {
-        float e = exp(scores[p] - global_max);
-        scores[p] = e;
-        my_sum += e;
-    }
-    float total = simd_sum(my_sum);
-    for (int p = lane; p <= past_len; p += 32)
-        scores[p] /= total;
-    
-    // Phase 3: weighted sum of V
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    float r0 = 0, r1 = 0;
-    for (int p = 0; p <= past_len; p++) {
-        ulong cache_ofs = ((ulong)p * n_kv_head + kv_head) * head_dim;
-        r0 += scores[p] * V_cache[cache_ofs + d0];
-        r1 += scores[p] * V_cache[cache_ofs + d1];
-    }
-    output[(uint)head * head_dim + d0] = r0;
-    output[(uint)head * head_dim + d1] = r1;
+
+    output[(uint)head * head_dim + d0] = O0 / d;
+    output[(uint)head * head_dim + d1] = O1 / d;
 }
 )";
 
@@ -610,7 +611,6 @@ inline void attention_op(Context& ctx,
     [g_batch_enc setBuffer:buf_V offset:0 atIndex:2];
     [g_batch_enc setBuffer:buf_O offset:0 atIndex:3];
     [g_batch_enc setBuffer:g_params_buf offset:slot atIndex:4];
-    [g_batch_enc setThreadgroupMemoryLength:((size_t)(past_len + 1) * 4 + 31) & ~31 atIndex:0];
     [g_batch_enc dispatchThreadgroups:MTLSizeMake(n_head, 1, 1)
      threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
 }
