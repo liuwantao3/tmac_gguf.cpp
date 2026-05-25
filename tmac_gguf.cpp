@@ -1765,9 +1765,11 @@ int main(int argc, char** argv) {
             printf("              Then click the Metal debugger camera icon.\n");
             printf("              Press Enter in this terminal to start inference...\n");
             fflush(stdout);
-            FILE* tty = fopen("/dev/tty", "r");
-            if (tty) { getc(tty); fclose(tty); }
-            else { printf("(no tty, continuing in 5s)\n"); sleep(5); }
+            for (;;) {
+                FILE* tty = fopen("/dev/tty", "r");
+                if (tty) { getc(tty); fclose(tty); break; }
+                sleep(1);
+            }
         }
         generate(hidden, logits, (int)tokens.size(), generate_n, 40);
     } else {
