@@ -65,6 +65,71 @@ static id<MTLCommandBuffer> g_batch_cb = nil;
 static id<MTLComputeCommandEncoder> g_batch_enc = nil;
 static id<MTLComputePipelineState> g_batch_pipe = nil;
 
+// ── GPU timestamp tracing (optional, via --perf) ──
+static bool g_trace_enabled = false;
+static const char* g_trace_name = nullptr;
+static id<MTLCounterSampleBuffer> g_trace_buf = nil;
+static constexpr int MAX_TRACE_SAMPLES = 512;
+static const char* g_trace_names[MAX_TRACE_SAMPLES];
+static int g_trace_idx = 0;
+
+inline void metal_trace_init(Context& ctx) {
+    for (id<MTLCounterSet> cs in ctx.device.counterSets) {
+        if ([[cs name] caseInsensitiveCompare:@"timestamp"] == NSOrderedSame) {
+            MTLCounterSampleBufferDescriptor* desc = [MTLCounterSampleBufferDescriptor new];
+            desc.counterSet = cs;
+            desc.storageMode = MTLStorageModeShared;
+            desc.sampleCount = MAX_TRACE_SAMPLES;
+            NSError* err;
+            g_trace_buf = [ctx.device newCounterSampleBufferWithDescriptor:desc error:&err];
+            if (!g_trace_buf) printf("[WARN] CounterBuffer: %s\n", [[err description] UTF8String]);
+            return;
+        }
+    }
+    // Fallback: try first counter set
+    if (ctx.device.counterSets.count > 0) {
+        MTLCounterSampleBufferDescriptor* desc = [MTLCounterSampleBufferDescriptor new];
+        desc.counterSet = ctx.device.counterSets[0];
+        desc.storageMode = MTLStorageModeShared;
+        desc.sampleCount = MAX_TRACE_SAMPLES;
+        NSError* err;
+        g_trace_buf = [ctx.device newCounterSampleBufferWithDescriptor:desc error:&err];
+        if (!g_trace_buf) printf("[WARN] CounterBuffer: %s\n", [[err description] UTF8String]);
+        return;
+    }
+    printf("[WARN] No timestamp counter set available\n");
+}
+
+inline void metal_trace_begin() {
+    g_trace_enabled = true;
+    g_trace_idx = 0;
+}
+
+inline void metal_trace_end() { g_trace_enabled = false; }
+
+inline void metal_trace_sample() {
+    if (!g_trace_enabled || !g_trace_buf || !g_batch_enc || !g_trace_name) return;
+    if (g_trace_idx >= MAX_TRACE_SAMPLES) return;
+    [g_batch_enc sampleCountersInBuffer:g_trace_buf
+                         atSampleIndex:g_trace_idx withBarrier:NO];
+    g_trace_names[g_trace_idx] = g_trace_name;
+    g_trace_idx++;
+}
+
+inline void metal_trace_report() {
+    if (!g_trace_buf || g_trace_idx < 2) { printf("[TRACE] No GPU timing data\n"); return; }
+    NSData* res = [g_trace_buf resolveCounterRange:NSMakeRange(0, g_trace_idx)];
+    const uint64_t* data = (const uint64_t*)[res bytes];
+    printf("\n[GPU PER-KERNEL TIMING]\n");
+    double total_ns = 0;
+    for (int i = 0; i < g_trace_idx - 1; i++) {
+        double ns = (double)(data[i+1] - data[i]);
+        total_ns += ns;
+        printf("  %-25s %8.1f us\n", g_trace_names[i], ns / 1000.0);
+    }
+    printf("  %-25s %8.1f us  (%.2f ms)\n", "TOTAL", total_ns, total_ns / 1000000.0);
+}
+
 inline void metal_batch_begin(Context& ctx) {
     g_batch_cb = [ctx.queue commandBuffer];
     g_batch_enc = nil;
@@ -135,6 +200,7 @@ inline void metal_batch_dispatch(
     [g_batch_enc setBuffer:bufY offset:0 atIndex:2];
     [g_batch_enc setBuffer:g_params_buf offset:slot atIndex:3];
 
+    metal_trace_sample();
     if (is_simd) {
         int total = ((rows + 3) / 4) * 64;
         [g_batch_enc dispatchThreads:MTLSizeMake(total, 1, 1)
@@ -510,6 +576,7 @@ inline bool init(Context& ctx) {
     ctx.initialized = true;
     printf("[METAL] Device: %s\n", [[ctx.device name] UTF8String]);
     printf("[METAL] Max threads/group: %zu\n", ctx.device.maxThreadsPerThreadgroup.width);
+    metal_trace_init(ctx);
     return true;
 }
 
@@ -577,6 +644,7 @@ inline void elem_op(Context& ctx, int op, float* data, const float* aux, int dim
     [g_batch_enc setBuffer:buf_d offset:0 atIndex:0];
     [g_batch_enc setBuffer:buf_a offset:0 atIndex:1];
     [g_batch_enc setBuffer:g_params_buf offset:slot atIndex:2];
+    metal_trace_sample();
     int total = ((dim + 63) / 64) * 64;
     [g_batch_enc dispatchThreads:MTLSizeMake(total, 1, 1)
      threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
@@ -591,6 +659,7 @@ inline void rope_op(Context& ctx, float* data, int n_heads, int head_dim, int po
     memcpy(&pp[3], &base, 4);
     [g_batch_enc setBuffer:buf_d offset:0 atIndex:0];
     [g_batch_enc setBuffer:g_params_buf offset:slot atIndex:2];
+    metal_trace_sample();
     int total = ((n_heads * head_dim / 2 + 63) / 64) * 64;
     [g_batch_enc dispatchThreads:MTLSizeMake(total, 1, 1)
      threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
@@ -606,6 +675,7 @@ inline void rmsnorm_op(Context& ctx, float* data, const float* weight, int dim) 
     [g_batch_enc setBuffer:buf_d offset:0 atIndex:0];
     [g_batch_enc setBuffer:buf_w offset:0 atIndex:1];
     [g_batch_enc setBuffer:g_params_buf offset:slot atIndex:2];
+    metal_trace_sample();
     [g_batch_enc dispatchThreads:MTLSizeMake(32, 1, 1)
      threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
 }
@@ -626,6 +696,7 @@ inline void attention_op(Context& ctx,
     [g_batch_enc setBuffer:buf_V offset:0 atIndex:2];
     [g_batch_enc setBuffer:buf_O offset:0 atIndex:3];
     [g_batch_enc setBuffer:g_params_buf offset:slot atIndex:4];
+    metal_trace_sample();
     [g_batch_enc dispatchThreadgroups:MTLSizeMake(n_head, 1, 1)
      threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
 }

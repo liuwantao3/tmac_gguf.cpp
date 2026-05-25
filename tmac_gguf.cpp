@@ -1524,65 +1524,68 @@ void forward_and_logits_fused(float* hidden, float* logits, int pos) {
     Tensor* emb_t = get_tensor_info("token_embd.weight");
     Tensor* norm_t = get_tensor_info("output_norm.weight");
 
+    if (g_perf_enabled) metal_backend::metal_trace_begin();
     metal_backend::metal_batch_begin(g_mtl_ctx);
 
     for (int layer = 0; layer < NUM_LAYERS; layer++) {
-        // ── Attention ──
-        metal_backend::elem_op(g_mtl_ctx, 2, scratch, hidden, HIDDEN_DIM);
+        metal_backend::g_trace_name = "attn_copy";   metal_backend::elem_op(g_mtl_ctx, 2, scratch, hidden, HIDDEN_DIM);
         snprintf(name, 128, "blk.%d.attn_norm.weight", layer);
-        metal_backend::rmsnorm_op(g_mtl_ctx, scratch,
+        metal_backend::g_trace_name = "attn_rms";    metal_backend::rmsnorm_op(g_mtl_ctx, scratch,
             (const float*)get_tensor_info(name)->data, HIDDEN_DIM);
         snprintf(name, 128, "blk.%d.attn_q.weight", layer);
-        matmul(get_tensor_info(name), scratch, q_vec, HIDDEN_DIM, HIDDEN_DIM);
+        metal_backend::g_trace_name = "attn_q";      matmul(get_tensor_info(name), scratch, q_vec, HIDDEN_DIM, HIDDEN_DIM);
         snprintf(name, 128, "blk.%d.attn_k.weight", layer);
-        matmul(get_tensor_info(name), scratch, k_new, K_DIM, HIDDEN_DIM);
+        metal_backend::g_trace_name = "attn_k";      matmul(get_tensor_info(name), scratch, k_new, K_DIM, HIDDEN_DIM);
         snprintf(name, 128, "blk.%d.attn_v.weight", layer);
-        matmul(get_tensor_info(name), scratch, v_new, V_DIM, HIDDEN_DIM);
+        metal_backend::g_trace_name = "attn_v";      matmul(get_tensor_info(name), scratch, v_new, V_DIM, HIDDEN_DIM);
         snprintf(name, 128, "blk.%d.attn_q.bias", layer);
         Tensor* t = get_tensor_info(name);
-        if (t) metal_backend::elem_op(g_mtl_ctx, 0, q_vec, (const float*)t->data, HIDDEN_DIM);
+        metal_backend::g_trace_name = "q_bias";      if (t) metal_backend::elem_op(g_mtl_ctx, 0, q_vec, (const float*)t->data, HIDDEN_DIM);
         snprintf(name, 128, "blk.%d.attn_k.bias", layer);
         t = get_tensor_info(name);
-        if (t) metal_backend::elem_op(g_mtl_ctx, 0, k_new, (const float*)t->data, K_DIM);
+        metal_backend::g_trace_name = "k_bias";      if (t) metal_backend::elem_op(g_mtl_ctx, 0, k_new, (const float*)t->data, K_DIM);
         snprintf(name, 128, "blk.%d.attn_v.bias", layer);
         t = get_tensor_info(name);
-        if (t) metal_backend::elem_op(g_mtl_ctx, 0, v_new, (const float*)t->data, V_DIM);
-        metal_backend::rope_op(g_mtl_ctx, q_vec, NUM_HEADS, HEAD_DIM, pos, 1000000.0f);
-        metal_backend::rope_op(g_mtl_ctx, k_new, NUM_KV_HEADS, HEAD_DIM, pos, 1000000.0f);
-        metal_backend::elem_op(g_mtl_ctx, 2, &g_k_cache[layer][pos][0], k_new, K_DIM);
-        metal_backend::elem_op(g_mtl_ctx, 2, &g_v_cache[layer][pos][0], v_new, V_DIM);
-        metal_backend::attention_op(g_mtl_ctx, q_vec,
+        metal_backend::g_trace_name = "v_bias";      if (t) metal_backend::elem_op(g_mtl_ctx, 0, v_new, (const float*)t->data, V_DIM);
+        metal_backend::g_trace_name = "rope_q";      metal_backend::rope_op(g_mtl_ctx, q_vec, NUM_HEADS, HEAD_DIM, pos, 1000000.0f);
+        metal_backend::g_trace_name = "rope_k";      metal_backend::rope_op(g_mtl_ctx, k_new, NUM_KV_HEADS, HEAD_DIM, pos, 1000000.0f);
+        metal_backend::g_trace_name = "kv_cache";    metal_backend::elem_op(g_mtl_ctx, 2, &g_k_cache[layer][pos][0], k_new, K_DIM);
+        metal_backend::g_trace_name = "kv_cache";    metal_backend::elem_op(g_mtl_ctx, 2, &g_v_cache[layer][pos][0], v_new, V_DIM);
+        metal_backend::g_trace_name = "attn";        metal_backend::attention_op(g_mtl_ctx, q_vec,
             &g_k_cache[layer][0][0], &g_v_cache[layer][0][0],
             context, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, pos);
         snprintf(name, 128, "blk.%d.attn_output.weight", layer);
-        matmul(get_tensor_info(name), context, attn_out, HIDDEN_DIM, HIDDEN_DIM);
-        metal_backend::elem_op(g_mtl_ctx, 0, hidden, attn_out, HIDDEN_DIM);
+        metal_backend::g_trace_name = "attn_out";    matmul(get_tensor_info(name), context, attn_out, HIDDEN_DIM, HIDDEN_DIM);
+        metal_backend::g_trace_name = "residual1";   metal_backend::elem_op(g_mtl_ctx, 0, hidden, attn_out, HIDDEN_DIM);
 
-        // ── FFN ──
-        metal_backend::elem_op(g_mtl_ctx, 2, scratch, hidden, HIDDEN_DIM);
+        metal_backend::g_trace_name = "ffn_copy";    metal_backend::elem_op(g_mtl_ctx, 2, scratch, hidden, HIDDEN_DIM);
         snprintf(name, 128, "blk.%d.ffn_norm.weight", layer);
-        metal_backend::rmsnorm_op(g_mtl_ctx, scratch,
+        metal_backend::g_trace_name = "ffn_rms";     metal_backend::rmsnorm_op(g_mtl_ctx, scratch,
             (const float*)get_tensor_info(name)->data, HIDDEN_DIM);
         snprintf(name, 128, "blk.%d.ffn_gate.weight", layer);
-        matmul(get_tensor_info(name), scratch, gate_up, INTER_DIM, HIDDEN_DIM);
+        metal_backend::g_trace_name = "ffn_gate";    matmul(get_tensor_info(name), scratch, gate_up, INTER_DIM, HIDDEN_DIM);
         snprintf(name, 128, "blk.%d.ffn_up.weight", layer);
-        matmul(get_tensor_info(name), scratch, gate_up + INTER_DIM, INTER_DIM, HIDDEN_DIM);
-        metal_backend::elem_op(g_mtl_ctx, 1, gate_up, nullptr, INTER_DIM);
+        metal_backend::g_trace_name = "ffn_up";      matmul(get_tensor_info(name), scratch, gate_up + INTER_DIM, INTER_DIM, HIDDEN_DIM);
+        metal_backend::g_trace_name = "silu";        metal_backend::elem_op(g_mtl_ctx, 1, gate_up, nullptr, INTER_DIM);
         snprintf(name, 128, "blk.%d.ffn_down.weight", layer);
-        matmul(get_tensor_info(name), gate_up, ffn_out, HIDDEN_DIM, INTER_DIM);
-        metal_backend::elem_op(g_mtl_ctx, 0, hidden, ffn_out, HIDDEN_DIM);
+        metal_backend::g_trace_name = "ffn_down";    matmul(get_tensor_info(name), gate_up, ffn_out, HIDDEN_DIM, INTER_DIM);
+        metal_backend::g_trace_name = "residual2";   metal_backend::elem_op(g_mtl_ctx, 0, hidden, ffn_out, HIDDEN_DIM);
     }
 
     // Output norm + logits (inside same command buffer)
     if (norm_t) {
-        metal_backend::elem_op(g_mtl_ctx, 2, scratch, hidden, HIDDEN_DIM);
-        metal_backend::rmsnorm_op(g_mtl_ctx, scratch, (const float*)norm_t->data, HIDDEN_DIM);
-        matmul(emb_t, scratch, logits, VOCAB_SIZE, HIDDEN_DIM);
+        metal_backend::g_trace_name = "out_copy";    metal_backend::elem_op(g_mtl_ctx, 2, scratch, hidden, HIDDEN_DIM);
+        metal_backend::g_trace_name = "out_rms";     metal_backend::rmsnorm_op(g_mtl_ctx, scratch, (const float*)norm_t->data, HIDDEN_DIM);
+        metal_backend::g_trace_name = "logits";      matmul(emb_t, scratch, logits, VOCAB_SIZE, HIDDEN_DIM);
     } else {
-        matmul(emb_t, hidden, logits, VOCAB_SIZE, HIDDEN_DIM);
+        metal_backend::g_trace_name = "logits";      matmul(emb_t, hidden, logits, VOCAB_SIZE, HIDDEN_DIM);
     }
 
     metal_backend::metal_batch_end();
+    if (g_perf_enabled) {
+        metal_backend::metal_trace_end();
+        metal_backend::metal_trace_report();
+    }
 }
 
 int sample_token(float* logits, int top_k) {
