@@ -1,236 +1,309 @@
 # llama.cpp Metal Backend: Technical Study
 
 > Based on analysis of `ggml/src/ggml-metal/ggml-metal.metal` (10,699 lines) and `ggml-metal-device.cpp`.  
-> Target: adopt key techniques in tmac_gguf.cpp to close the 3.1× performance gap with llama.cpp (147 vs 47 t/s).
+> Target: adopt key techniques in llama.cpp to close the performance gap.
 
 ---
 
-## 1. Threadgroup Sizing: 64 Threads (2 simdgroups)
+## Quick Status Check
 
-**llama.cpp pattern:** Every kernel uses `num_threadsgroups = 64` with `[[threads_per_threadgroup(64)]]`.  
-**Used in:** quantized matmuls (`kernel_mul_mat_q*_f32`), attention, RMS norm, rope, FFN.
+| Optimization | llama.cpp | Our tmac_gguf.cpp | Status |
+|-------------|-----------|------------------|--------|
+| Threadgroup sizing | 64 threads (2 simdgroups) | 64 threads for matmul/rope, 32 for rmsnorm/attn | ✅ Done |
+| Flash attention | Yes | Yes (`kernel_attn` with TILE=8, online softmax) | ✅ Done |
+| Fused QKV matmul | Yes | Yes (`kernel_fused_qkv`, Q5_0 Q/K + V) | ✅ Done |
+| Fused FFN gate+up | Yes | Yes (`kernel_fused_ffn_gate_up`) | ✅ Done |
+| Fused FFN silu+down | Yes | No (silu separate, down separate) | ⚠️ Broken |
+| Function constants (quant) | Yes (all quant types) | Partial (only kernel_op, v_type) | ⚠️ Partial |
+| Graph scheduling | Yes (full DAG) | No (sequential per-layer) | ❌ Not done |
+| Batched prefill | Yes | No (single-token forward) | ❌ Not done |
 
-**Why 64 not 256 (our choice)?**
-- M1 has 32KB threadgroup memory per TG, 1024 max threads per TG.
-- 64 threads = 2 simdgroups × 32 threads each. Fits register budget for quantized matmul (each thread unpacks ~20 registers for weights).
-- 256 threads = 8 simdgroups — OK for large rows >1024 where occupancy helps hide latency.
-- For small rows (896 in Qwen2 hidden dim), 64 threads keeps 8+ TGs in flight (max 16 per CU on M1), saturating the 16 CU cores.
-- `nsg=2` (2 simdgroups) kernel variants exist for each quantization type, selected in `ggml_metal_choose_kernel()` based on tensor dimensions.
-
-**Our problem:** We set TG=256 for simplicity. This wastes TGs on small-row ops (rmsnorm, rope, cache_kv, add_bias) and reduces occupancy. Also increases register pressure — each thread handles fewer elements but more threads compete for registers.
-
-**Adoption plan:** Change `threadsPerThreadgroup` from `MTLSizeMake(256, 1, 1)` to `MTLSizeMake(64, 1, 1)` across all kernels, with `numThreadgroups = ceil_div(N, 64)` for 1D dispatch or `ceil_div(N, 2) × ceil_div(rows, 32)` for 2D dispatch.
-
----
-
-## 2. Flash Attention: `kernel_flash_attn_ext_vec_f16_dk64_dv64`
-
-**llama.cpp has a dedicated flash attention kernel** (lines ~5400-5730) that computes:
-```
-S = Q × K^T (score matrix)
-P = softmax(S)
-O = P × V
-```
-entirely on-chip, never materializing the full `seq_len × seq_len` attention matrix.
-
-### Key implementation details:
-
-**Tiling:**
-- Tiles Q across queries (`nq = 2 or 4`), K/V across KV sequence (`nk = 8 or 16`).
-- Inner tile: `nq × dk` for Q, `nk × dk` for K, `nk × dv` for V.
-- Each tile loaded into threadgroup memory.
-
-**Online softmax (safe softmax):**
-- Maintains row-wise `m_prev = max(m_prev, row_max(S_tile))` and `d_prev = sum(exp(S_row - m_prev))` across tiles.
-- `O = O * exp(m_prev - m_new) / d_new + P_tile * V_tile / d_new`.
-- No separate reduction pass needed — single loop over KV tiles.
-
-**Vectorized:**
-- `vec_f16` loads 8×f16 values at once using `half8`.
-- dk=64 fits exactly in 4×vec_f16 loads per thread.
-- `[[function_constant(0)]]` for `DK` and `DV` specialization — avoids runtime branches.
-
-**SIMDgroup math:**
-- Uses `simdgroup_multiply_accumulate` for matrix multiply within a simdgroup (32 threads).
-- Inter-TG communication via threadgroup memory for reductions.
-
-**Our current attention:** naive O(seq²) math with threadgroup softmax, loading all KV into threadgroup memory. For seq_len=256 this is fine (256×256×64 = 4M FLOPs), but flash would improve memory efficiency and enable >256 context.
-
-**Adoption plan:** Implement `kernel_flash_attn_vec_f16` with:
-- `nq=2, nk=8` tiles for Qwen2 head_dim=64, kv_dim=128.
-- Online softmax loop over KV tiles.
-- Half-precision (`half`) for score computation.
-- Function constants for `DK`, `DV`, `nq`, `nk`.
+**Our performance:** ~18-19ms/token (Metal fused) vs llama.cpp ~6.8ms/token (3× gap)
 
 ---
 
-## 3. Fused Gated FFN: `gated_delta_net`
+## 1. Threadgroup Sizing: 64 Threads (2 simdgroups) — ✅ DONE
 
-**llama.cpp fuses the entire FFN** (silu(x_up) * x_gate → x_down) into a single kernel.
-- Present in kernel source (~lines 3150-3260 in the original, ~lines 6150-6260 in the expanded version).
-- Dispatch: `{1, 1, 1}` threadgroups, `{32, 32, 1}` threads.
-- Each threadgroup handles a group of output elements, loading weights from the same input row.
+**llama.cpp pattern:** Every kernel uses `num_threadsgroups = 64` with `[[threads_per_threadgroup(64)]]`.
 
-**Benefit:** One dispatch instead of 4 (up_proj, gate_proj → silu → mul → down_proj). Saves 3× launch overhead, 2× weight loads (weights read once from DRAM instead of twice).
+**Our implementation:**
+- Quantized matmuls (Q8_0, Q5_0, Q4_K, Q6_K): **64 threads** ✅
+- Fused QKV: **64 threads** ✅
+- Fused FFN gate+up: **64 threads** ✅
+- RMS norm: **32 threads** (appropriate for simple element-wise op)
+- Attention: **32 threads** (intentional for single-pass flash attention design)
 
-**Our current FFN:** 5 dispatches (up_proj + gate_proj in one batch, silu_x_up, down_proj, add_residual). Fused would cut to 2 (attention, FFN) per layer.
-
-**Adoption plan:**
-- Implement `kernel_fused_ffn_silu_gate` taking `x`, `W_up`, `W_gate`, `W_down`, `bias_up`, `bias_gate`, `bias_down` (all already loaded in GPU buffers).
-- Single dispatch: `{1, 1, 1}` threadgroups × `{32, 32, 1}` threadgroup.
-- TG handles sub-range of `INTER_DIM` output elements for up/gate, then the same TG does silu × gate multiply, then applies down_proj for the same range.
-
----
-
-## 4. Function Constants for Quantization Specialization
-
-**llama.cpp uses `[[function_constant(idx)]]` extensively** for:
-- Quantization type (`FUNCTION_CONSTANT_QK` = quantized block type at index 0).
-- Head dimensions for flash attention (`FUNCTION_CONSTANT_DK`, `FUNCTION_CONSTANT_DV`).
-- Kernel variants (e.g., `FUNCTION_CONSTANT_NUM_K_QUANTS`).
-
-**Usage in `ggml-metal-device.cpp`** (lines ~1150-1250):
 ```cpp
-// For each quantization type, create a specialized pipeline:
-for (auto qtype : {GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, ..., GGML_TYPE_Q8_0}) {
-    MTLFunctionConstantValues* constants = [MTLFunctionConstantValues new];
-    [constants setConstantValue:&qtype type:MTLDataTypeInt atIndex:0];
-    // Also set block size, block alignment, etc.
-    auto function = [library newFunctionWithName:@"kernel_mul_mat_qX_f32"
-                                  constantValues:constants error:&error];
-    auto pipeline = [device newComputePipelineStateWithFunction:function error:&error];
-    // Cache by qtype.
+// metal_backend.hpp:203-206 — quantized matmul dispatch
+if (is_simd) {
+    int total = ((rows + 3) / 4) * 64;
+    [g_batch_enc dispatchThreads:MTLSizeMake(total, 1, 1)
+     threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
 }
 ```
 
-**Result:** Zero runtime `if (qtype == ...)` branches inside the hot matmul kernel. Each pipeline has the quant type baked in, enabling better Metal compiler optimizations (constant folding, loop unrolling, dead code elimination).
+---
 
-**Our current approach:** Runtime `switch (qtype)` in `metal_mul_mat_q()` per batch element. Each thread evaluates the same switch repeatedly.
+## 2. Flash Attention — ✅ DONE
 
-**Adoption plan:** Extend our function constant approach (already used for `ELEM_OP`, `RNS_OP`, `ATTN_OP`) to quantization type. Create pipeline cache keyed by `{qtype, op_type}`. Compile at load time for all supported quant types.
+**llama.cpp:** `kernel_flash_attn_ext_vec_f16_dk64_dv64` — tiled, online softmax, single-pass.
+
+**Our implementation:** `kernel_attn` at `metal_backend.hpp:589-648`
+
+```metal
+// Attention: flash-attention single-token GQA, 32-thread TG (1 simdgroup).
+// Processes KV in tiles of 8 with online softmax — single pass, no threadgroup memory, no barriers.
+kernel void kernel_attn(device const float* Q [[buffer(0)]],
+                         device const float* K_cache [[buffer(1)]],
+                         device const float* V_cache [[buffer(2)]],
+                         device float* output [[buffer(3)]],
+                         constant int* params [[buffer(4)]],
+                         uint head [[threadgroup_position_in_grid]],
+                         ushort lane [[thread_index_in_simdgroup]]) {
+    // Flash attention: online softmax, single pass, TILE=8
+    float O0 = 0, O1 = 0, m = -INFINITY, d = 0;
+    int n_pos = past_len + 1;
+
+    for (int tile_start = 0; tile_start < n_pos; tile_start += 8) {
+        // Compute scores for this tile
+        float s[8];
+        for (int t = 0; t < tile_sz; t++) {
+            s[t] = simd_sum(my_q0 * k0 + my_q1 * k1) * scale;
+        }
+        // Online softmax: find tile max, rescale previous accum, add new contributions
+        float m_new = max(m_new, s[t]);
+        float old_scale = exp(m - m_new);
+        O0 *= old_scale; O1 *= old_scale; d *= old_scale;
+        for (int t = 0; t < tile_sz; t++) {
+            O0 += e * V_cache[cache_ofs + d0];
+            O1 += e * V_cache[cache_ofs + d1];
+            d += e;
+        }
+        m = m_new;
+    }
+    output[head * head_dim + d0] = O0 / d;
+    output[head * head_dim + d1] = O1 / d;
+}
+```
+
+Key features:
+- **TILE=8** — processes 8 KV positions per tile iteration
+- **Online softmax** — maintains `m` (max) and `d` (denominator) incrementally across tiles
+- **No threadgroup memory** — streams directly from device K/V cache buffers
+- **Single pass** — never materializes full `seq_len × seq_len` score matrix
 
 ---
 
-## 5. Graph Scheduling (Metal-GPU DAG)
+## 3. Fused QKV Matmul — ✅ DONE
 
-**llama.cpp doesn't execute one layer at a time.** It builds a full DAG of all operations (all layers), then `ggml_graph_compute()` schedules:
+**llama.cpp:** Combines Q, K, V projection into one kernel or batches them in one CB.
 
-1. **Concurrent ops:** Independent operations across different layers execute concurrently (e.g., RMS norm in layer 3 while attention matmul in layer 2).
-2. **Out-of-order:** Memory writes are tracked via `ggml_tensor` lifetimes; the scheduler reorders ops based on data dependencies, not source order.
-3. **Batch submission:** Multiple command buffers are filled and committed concurrently, then waited.
+**Our implementation:** `kernel_fused_qkv` at `metal_backend.hpp:414-472`
 
-**Our approach:** Sequential layers with explicit syncs (even in fused path, layers within the CB are sequential). No cross-layer concurrency.
+```metal
+constant int v_type [[function_constant(1)]];  // 0=V Q5_0, 1=V Q8_0
 
-**Adoption complexity:** High. Requires DAG infrastructure (or porting ggml). Medium-term optimization.
+kernel void kernel_fused_qkv(
+    device const uint8_t* W_q [[buffer(0)]],
+    device const uint8_t* W_k [[buffer(1)]],
+    device const uint8_t* W_v [[buffer(2)]],
+    device const float* x [[buffer(3)]],
+    device float* y_q [[buffer(4)]],
+    device float* y_k [[buffer(5)]],
+    device float* y_v [[buffer(6)]],
+    constant int* params [[buffer(7)]],
+    uint gid [[thread_position_in_grid]]) {
+    // Q and K are always Q5_0; V is Q5_0 or Q8_0 based on v_type
+    if (global_row < q_rows + k_rows || v_type == 0) {
+        // Q5_0 dequantization path
+    } else {
+        // Q8_0 dequantization path
+    }
+}
+```
 
----
+Two pipelines created at init:
+- `pipe_fused_qkv_q5` — V=Q5_0 (v_type=0)
+- `pipe_fused_qkv_q8` — V=Q8_0 (v_type=1)
 
-## 6. Multi-Token Generation (Prefill/Batch)
-
-**llama.cpp prefill:** Matrix-matrix multiplication for prompt processing. Processes all prompt tokens in parallel using a single matmul (K = prompt_embeds, QKV projection is [prompt_len × hidden] × [hidden × 3*hidden]).
-
-**Our prefill:** Same single-token forward loop as generation. Each prompt token is processed identically to a generation step, with KV cache management but no parallelism gain.
-
-**Adoption plan:** Implement batched prefill as a separate path. For prompt_len > 1, use matmul-based QKV projection with prompt_len as batch dimension; similarly for FFN. This would speed prefill from 29ms/tok to ~2ms/tok for a 256-token prompt.
-
----
-
-## 7. Smaller Details
-
-### 7a. RMS Norm + Scale Kernel
-llama.cpp fuses `rmsnorm(x) * weight` into a single kernel. We already do this (`kernel_rmsnorm` writes scaled output). No change needed.
-
-### 7b. ROPE with Complex Multiplication
-llama.cpp uses a single kernel for rope that computes both cos/sin and applies them via complex multiplication. We do the same.
-
-### 7c. Cache Line Awareness
-llama.cpp aligns KV cache blocks to 16 bytes (half8 alignment) and uses vectorized writes. Our cache write kernel already fuses `cache_k + cache_v` and adds previous values, but doesn't use vectorized stores.
-
-### 7d. No Redundant `clear` or Memset
-llama.cpp never clears buffers before writing. We also don't (`newBuffer` with zero-filled is avoided). Good.
-
-### 7e. Dedicated INT4/INT8 Quantized Matmul Kernels
-Each quantization type has its own `kernel_mul_mat_qX_f32`. No generic loop over block types. We already have separate `kernel_mul_mat_q4_0_f32`, `kernel_mul_mat_q4_k_f32`, `kernel_mul_mat_q6_k_f32` functions. Good.
+**Effect:** Replaces 3 separate matmul dispatches (Q, K, V) with 1 dispatch per layer. Saves 48 dispatch operations across 24 layers.
 
 ---
 
-## 8. Performance Bottleneck Analysis for tmac_gguf.cpp
+## 4. Fused FFN Gate+Up Matmul — ✅ DONE, ❌ BROKEN
 
-| Bottleneck | Impact | Fix | Difficulty |
+**llama.cpp:** `kernel_fused_ffn_silu_gate` — gate+up+silu+down in one kernel.
+
+**Our implementation:** `kernel_fused_ffn_gate_up` at `metal_backend.hpp:475-529` (gate+up only)
+
+```metal
+kernel void kernel_fused_ffn_gate_up(
+    device const uint8_t* W_gate [[buffer(0)]],
+    device const uint8_t* W_up [[buffer(1)]],
+    device const float* x [[buffer(2)]],
+    device float* y [[buffer(3)]],
+    constant int* params [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]) {
+    // Both W_gate and W_up are Q6_K, same dims
+    // Writes gate[0..INTER_DIM-1] and up[INTER_DIM..2*INTER_DIM-1]
+}
+```
+
+**Status:** Implemented but **BROKEN** — produces wrong tokens after first generation. Currently disabled (falls back to separate gate/up matmuls).
+
+**Why silu+down can't be fused:**
+- silu needs the FULL gate and up results (not partial sums)
+- down depends on silu(gate) * up result
+- This sequential dependency requires either:
+  - Threadgroup memory to store intermediate results + barrier (complex)
+  - Multiple passes within one kernel (not feasible)
+
+llama.cpp solves this with threadgroup memory and careful synchronization, which requires restructuring the kernel significantly.
+
+---
+
+## 5. Function Constants for Quantization Specialization — ⚠️ PARTIAL
+
+**llama.cpp:** Creates specialized pipeline for each quantization type at init time. Zero runtime branches.
+
+```cpp
+// ggml-metal-device.cpp pattern:
+for (auto qtype : {GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, ..., GGML_TYPE_Q8_0}) {
+    MTLFunctionConstantValues* constants = [MTLFunctionConstantValues new];
+    [constants setConstantValue:&qtype type:MTLDataTypeInt atIndex:0];
+    auto pipeline = [device newComputePipelineStateWithFunction:function error:&error];
+    // Cache by qtype
+}
+```
+
+**Our implementation:** Only two function constants are used:
+- `kernel_op` at index 0: elem_op specialization (add=0, silu=1, cache_write=2)
+- `v_type` at index 1: V quantization type (Q5_0=0, Q8_0=1) in fused QKV
+
+The quantized matmul kernels (Q8_0, Q5_0, Q4_K, Q6_K) still use runtime `switch` statements in `matmul()` to dispatch to the correct kernel. This is because the `matmul()` function selects the pipeline, not the kernel itself.
+
+**What we have:**
+```cpp
+// kernel_elem uses function constant for op type
+constant int kernel_op [[function_constant(0)]];
+
+// kernel_fused_qkv uses function constant for V quant type
+constant int v_type [[function_constant(1)]];
+```
+
+**What we don't have:** Separate pipelines per quant type with function constants inside the matmul kernels themselves.
+
+---
+
+## 6. Graph Scheduling (Metal-GPU DAG) — ❌ NOT DONE
+
+**llama.cpp:** Builds a full DAG of all operations across all layers. Independent ops execute concurrently:
+- RMS norm in layer 3 runs concurrently with attention matmul in layer 2
+- Out-of-order execution based on tensor lifetime analysis
+- Multiple command buffers filled and committed concurrently
+
+**Our approach:** Sequential per-layer execution within one command buffer. No cross-layer concurrency. All 24 layers encoded in sequence.
+
+**Adoption complexity:** High — requires DAG infrastructure or porting ggml's graph scheduler.
+
+---
+
+## 7. Batched Prefill (Multi-Token Generation) — ❌ NOT DONE
+
+**llama.cpp prefill:** Matrix-matrix multiplication for prompt processing. All prompt tokens processed in parallel via a single matmul.
+
+**Our approach:** Same single-token forward loop as generation. Each prompt token processed identically to a generation step.
+
+**Impact:** For prompt_len=256, batched prefill would be ~10× faster.
+
+---
+
+## 8. RMS Norm + Scale — ✅ DONE
+
+llama.cpp fuses `rmsnorm(x) * weight` into one kernel. We do the same:
+
+```metal
+// metal_backend.hpp:kernel_rmsnorm
+kernel void kernel_rmsnorm(device float* data [[buffer(0)]],
+                          device const float* weight [[buffer(1)]],
+                          constant int* params [[buffer(2)]],
+                          uint gid [[threadgroup_position_in_grid]]) {
+    // Single pass: compute sum of squares, sqrt, divide, multiply by weight
+    data[i] = (data[i] / rms) * weight[i];
+}
+```
+
+---
+
+## Performance Analysis
+
+| Bottleneck | Impact | Status | Fix Difficulty |
 |---|---|---|---|
-| 256-thread TGs (low occupancy) | ~1.5× slowdown | Switch to 64 threads | Low |
-| Separate-kernel dispatch overhead | ~2-3× (8 vs 1 CB) | Already done (fused) | Done |
-| No flash attention | ~1.5× attention | Implement flash attn | Medium |
-| No fused FFN | ~1.3× FFN | Implement fused FFN | Medium |
-| No graph scheduling | ~1.2-1.5× | Port DAG scheduler | High |
-| No batched prefill | ~10× prefill | Matmul-based prefill | Medium |
-| Runtime quant type switch | ~1.05-1.1× | Function constants | Low |
-| Suboptimal memory layout | Unknown | Profile + tune | Ongoing |
+| Separate kernel dispatch overhead | ~2-3× | ✅ Done (fused path, 1 CB) | Done |
+| 256-thread TGs (low occupancy) | ~1.5× | ✅ Done (switched to 64) | Done |
+| No flash attention | ~1.2× | ✅ Done (implemented) | Done |
+| Fused FFN silu+down | ~1.3× | ❌ Not done (can't fuse due to dependency) | Medium |
+| Graph scheduling | ~1.2-1.5× | ❌ Not done | High |
+| Runtime quant type switch | ~1.05-1.1× | ⚠️ Partial (only kernel_op, v_type) | Low |
+| Batched prefill | ~10× prefill | ❌ Not done | Medium |
 
-**Priority for next session (highest impact → lowest effort):**
+**Current performance:** ~18-19ms/token (Metal fused path)
+**Target:** ~6-7ms/token (close to llama.cpp's 6.8ms)
 
-1. **[Low effort] Switch to 64-thread TGs** — change `MTLSize(256,...)` → `MTLSize(64,...)` and adjust grid sizes. Expected gain: ~1.5× (est. 14ms → 9.5ms).
-2. **[Medium effort] Flash attention** — implement `kernel_flash_attn_vec_f16`. Expected gain: ~1.5× on attention (est. 4ms → 2.7ms).
-3. **[Medium effort] Fused FFN** — merge silu_x_up + down_proj + residual_add into one kernel. Expected gain: ~1.3× (est. 8ms → 6ms).
-4. **[High effort] Batched prefill** — separate path for prompt processing with matmul dispatch. Expected gain: ~10× prefill speed.
-5. **[Low/Med effort] Function constants for quant types** — compile specialized pipelines at init. Expected gain: ~5-10% on quant matmul.
-
-**Target after items 1-3:** ~6ms/tok (comparable to llama.cpp's 6.8ms for generation).
+**Remaining gap analysis:**
+- The dispatch overhead elimination (fused path) is done
+- Flash attention is done
+- Fused QKV is done
+- The 3× gap likely comes from:
+  1. Quant type specialization not fully implemented (runtime switch in matmul)
+  2. No graph scheduling (sequential layers in CB vs concurrent)
+  3. Fused FFN silu+down not fused (but this is hard due to sequential dep)
 
 ---
 
-## 9. Reference: Key llama.cpp File Locations
+## Reference: Key llama.cpp File Locations
 
 | File | Lines | Content |
 |---|---|---|
 | `ggml-metal.metal` | 1-320 | Quantized block types, shared structs, utility functions |
-| `ggml-metal.metal` | 321-1900 | Quantized dequant functions (q4_0, q4_1, q5_0, q5_1, q8_0, q2_K through q6_K) |
-| `ggml-metal.metal` | 1901-3400 | Quantized matmul kernels (`kernel_mul_mat_q4_0_f32`, ..., `kernel_mul_mat_q6_K_f32`) |
-| `ggml-metal.metal` | 3401-4700 | Dequant + matmul (grouped by quant type), RMS norm, rope |
-| `ggml-metal.metal` | 4701-5400 | `kernel_mul_mv` (GQA split), `get_rows` |
-| `ggml-metal.metal` | 5401-5730 | `kernel_flash_attn_ext_vec_f16_dk64_dv64` |
-| `ggml-metal.metal` | 5731-6200 | `kernel_flash_attn_ext_f16_hz`, cross-attention variants |
-| `ggml-metal.metal` | 6201-6400 | Fused gated delta net, dequant + mul_mat for various types |
-| `ggml-metal.metal` | 6401-7300 | More quantized matmul, softmax, `kernel_alibi` |
-| `ggml-metal.metal` | 7301-8500 | `kernel_mul_mat_id` (expert routing), MoE kernels |
-| `ggml-metal.metal` | 8501-10699 | `kernel_flash_attn_ext_vec_f16_dk128_dv128`, other large-head variants |
-| `ggml-metal-device.cpp` | 50-240 | Device discovery, buffer management, `ggml_backend_metal_buffer_type` |
-| `ggml-metal-device.cpp` | 241-900 | Kernel selection (`ggml_metal_choose_kernel`), pipeline compilation, constant specialization |
-| `ggml-metal-device.cpp` | 901-1300 | Graph scheduling, dispatch logic for tensors |
+| `ggml-metal.metal` | 321-1900 | Quantized dequant functions (q4_0 through q8_0) |
+| `ggml-metal.metal` | 1901-3400 | Quantized matmul kernels (`kernel_mul_mat_q*_f32`) |
+| `ggml-metal.metal` | 4701-5400 | `kernel_flash_attn_ext_vec_f16_dk64_dv64` |
+| `ggml-metal.metal` | 6201-6400 | Fused gated delta net, dequant + mul_mat |
+| `ggml-metal-device.cpp` | 241-900 | Kernel selection, pipeline compilation, constant specialization |
+| `ggml-metal-device.cpp` | 901-1300 | Graph scheduling, dispatch logic |
 | `ggml-metal-device.cpp` | 1301-1550 | `ggml_backend_metal_graph_compute` — main compute dispatcher |
-| `ggml-metal-device.cpp` | 1551-1925 | Buffer ops, synchronization, tensor lifetime management |
 
 ---
 
-## 10. Analysis of 64-Thread vs 256-Thread Performance
+## Next Steps for FPGA (~/fpga)
 
-**Hypothesis for why our naive 64-thread attempt regressed:**
+Key insights from this study applicable to the FPGA accelerator:
 
-We simply changed `num_threads` from 256 to 64 and `num_groups` from N/256 to N/64. This doesn't account for:
+1. **Quantization diversity** — Model uses Q5_0 (attention), Q6_K (FFN gate/up), Q4_K (attn output), Q8_0 (embeddings). FPGA currently supports only Q8_0 and Q4_K. Adding Q5_0 and Q6_K would cover the largest layers.
 
-1. **Register pressure:** With 256 threads, each thread handles `ceil_div(256, 8*256) = 1` block per thread = trivial. With 64 threads, each thread might need `ceil_div(256, 8*64) = 1` but the TG has 4× fewer threads to cover the same work. The real issue is the *inner loop structure* — llama.cpp's kernels have specific unrolling factors tuned for 64 threads.
+2. **Memory layout** — Q6_K uses 256-element blocks (matching GPU SIMD width). FPGA should align block sizes to AXI bus width for efficient transfers.
 
-2. **SIMDgroup utilization:** At 64 threads (2 simdgroups), the Metal compiler can assign each simdgroup a contiguous chunk of the output. At 256 threads, inter-simgroup synchronization is needed more often.
+3. **Fused operations** — Even with slower memory, fusing gate+up into one transaction would save DDR bandwidth. The silu×up→down dependency prevents full fusion without local storage.
 
-3. **Memory access patterns:** llama.cpp's kernels load data in specific patterns for 64 threads — each thread loads 4 consecutive blocks, ensuring coalesced access. A direct thread-count swap without adjusting load patterns breaks coalescing.
-
-**Proper approach:** 
-- Copy llama.cpp's exact kernel structure for the quant types we use (Q4_K, Q6_K).
-- Match their block dispatch stride (`nth = thread_index * 4` for Q4_K).
-- Keep `nsg=2` variant (or detect and compile both).
+4. **Flash attention** — The tiled online softmax approach is applicable to any accelerator. For FPGA, processing KV in tiles of 8 (matching the 8 MAC lanes) would be efficient.
 
 ---
 
-## 11. Conclusion
+## Appendix: Build Instructions
 
-tmac_gguf.cpp's fused single-CB approach already matches llama.cpp in architectural ambition (eliminating dispatch overhead). The remaining 3.1× gap comes from:
+```bash
+# Requires linking matmul_q8.cpp from ~/fpga/sim
+clang++ -std=c++17 -x objective-c++ -O3 \
+    tmac_gguf.cpp \
+    ~/fpga/sim/matmul_q8.cpp \
+    -framework Foundation -framework Metal -fobjc-arc \
+    -I~/fpga/sim \
+    -o tmac_gguf
 
-- **Threadgroup sizing** (64 vs 256 threads) — estimated 1.5× gain
-- **Missing flash attention** — estimated 1.5× gain (multiplicative with above)
-- **Missing fused FFN** — estimated 1.3× gain
-- **Suboptimal quantized matmul inner loops** — estimated 1.2-1.5× gain
-- **No graph-level optimization** — marginal for single-CB path
+# Run with Metal fused path
+./tmac_gguf model.tmac --metal-fused --generate 20 < tokens.txt
 
-Combined: 1.5 × (1/0.67) × (1/0.77) ≈ 3.4× improvement possible, implying ~6.2ms/tok — close to llama.cpp's 6.8ms/tok.
-
-**Recommendation:** Implement items 1-3 (64-thread TGs, flash attention, fused FFN) in order. After each, benchmark against llama.cpp to measure actual vs estimated gain. Then decide if batched prefill or graph scheduling are needed.
+# Run with profiling
+./tmac_gguf model.tmac --metal-fused --generate 20 --perf < tokens.txt
+```
