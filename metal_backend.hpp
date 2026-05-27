@@ -69,6 +69,11 @@ static id<MTLCommandBuffer> g_batch_cb = nil;
 static id<MTLComputeCommandEncoder> g_batch_enc = nil;
 static id<MTLComputePipelineState> g_batch_pipe = nil;
 
+// ── Multi-CB support (commit without wait, then wait-all at end) ──
+static constexpr int MAX_CBS = 32;
+static id<MTLCommandBuffer> g_committed_cbs[MAX_CBS] = {};
+static int g_num_committed_cbs = 0;
+
 // ── GPU timestamp tracing (optional, via --perf) ──
 static bool g_trace_enabled = false;
 static const char* g_trace_name = nullptr;
@@ -129,14 +134,35 @@ inline void metal_trace_report() {
     printf("  %-25s %8.1f us  (%.2f ms)\n", "TOTAL", total_ns, total_ns / 1000000.0);
 }
 
-inline void metal_batch_begin(Context& ctx) {
+inline void metal_batch_begin(Context& ctx, bool reset_offset = true) {
     g_batch_cb = [ctx.queue commandBuffer];
     g_batch_enc = nil;
     g_batch_pipe = nil;
-    g_params_offset = 0;
+    if (reset_offset) g_params_offset = 0;
     if (!g_params_buf)
         g_params_buf = [ctx.device newBufferWithLength:PARAMS_POOL_SIZE
                          options:MTLStorageModeShared];
+}
+
+// Commit current CB without waiting (appends to committed list for batch_wait_all)
+inline void metal_batch_commit() {
+    if (g_batch_enc) { [g_batch_enc endEncoding]; g_batch_enc = nil; g_batch_pipe = nil; }
+    if (g_batch_cb) {
+        [g_batch_cb commit];
+        if (g_num_committed_cbs < MAX_CBS) {
+            g_committed_cbs[g_num_committed_cbs++] = g_batch_cb;
+        }
+        g_batch_cb = nil;
+    }
+}
+
+// Wait for all committed CBs and clear the list
+inline void metal_batch_wait_all() {
+    for (int i = 0; i < g_num_committed_cbs; i++) {
+        [g_committed_cbs[i] waitUntilCompleted];
+        g_committed_cbs[i] = nil;
+    }
+    g_num_committed_cbs = 0;
 }
 
 inline void metal_batch_end() {
@@ -146,6 +172,8 @@ inline void metal_batch_end() {
         [g_batch_cb waitUntilCompleted];
         g_batch_cb = nil;
     }
+    // Also flush any previously committed CBs (safety)
+    metal_batch_wait_all();
 }
 
 inline void metal_batch_ensure_encoder(Context& ctx, id<MTLComputePipelineState> pipe) {
