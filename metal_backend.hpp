@@ -22,6 +22,7 @@ struct Context {
     id<MTLLibrary> library = nil;
     id<MTLComputePipelineState> pipe_fp32 = nil;
     id<MTLComputePipelineState> pipe_q8_0 = nil;
+    id<MTLComputePipelineState> pipe_q8_0_simd = nil;
     id<MTLComputePipelineState> pipe_q5_0 = nil;
     id<MTLComputePipelineState> pipe_q4_k = nil;
     id<MTLComputePipelineState> pipe_q6_k = nil;
@@ -72,66 +73,39 @@ static id<MTLComputePipelineState> g_batch_pipe = nil;
 // ── Multi-CB support (commit without wait, then wait-all at end) ──
 static constexpr int MAX_CBS = 32;
 static id<MTLCommandBuffer> g_committed_cbs[MAX_CBS] = {};
+static const char* g_committed_labels[MAX_CBS] = {};
 static int g_num_committed_cbs = 0;
 
-// ── GPU timestamp tracing (optional, via --perf) ──
+// ── Per-CB GPU timing (via GPUStartTime/GPUEndTime, set via --perf) ──
 static bool g_trace_enabled = false;
 static const char* g_trace_name = nullptr;
-static id<MTLCounterSampleBuffer> g_trace_buf = nil;
-static constexpr int MAX_TRACE_SAMPLES = 512;
-static const char* g_trace_names[MAX_TRACE_SAMPLES];
-static int g_trace_idx = 0;
+static const char* g_cb_labels[MAX_CBS];
+static double g_cb_ms[MAX_CBS];
+static int g_cb_count = 0;
 
-inline void metal_trace_init(Context& ctx) {
-    for (id<MTLCounterSet> cs in ctx.device.counterSets) {
-        if ([[cs name] caseInsensitiveCompare:@"timestamp"] == NSOrderedSame) {
-            MTLCounterSampleBufferDescriptor* desc = [MTLCounterSampleBufferDescriptor new];
-            desc.counterSet = cs;
-            desc.storageMode = MTLStorageModeShared;
-            desc.sampleCount = MAX_TRACE_SAMPLES;
-            NSError* err;
-            g_trace_buf = [ctx.device newCounterSampleBufferWithDescriptor:desc error:&err];
-            if (!g_trace_buf) printf("[WARN] CounterBuffer: %s\n", [[err description] UTF8String]);
-            return;
-        }
-    }
-    // Fallback: try first counter set
-    if (ctx.device.counterSets.count > 0) {
-        MTLCounterSampleBufferDescriptor* desc = [MTLCounterSampleBufferDescriptor new];
-        desc.counterSet = ctx.device.counterSets[0];
-        desc.storageMode = MTLStorageModeShared;
-        desc.sampleCount = MAX_TRACE_SAMPLES;
-        NSError* err;
-        g_trace_buf = [ctx.device newCounterSampleBufferWithDescriptor:desc error:&err];
-        if (!g_trace_buf) printf("[WARN] CounterBuffer: %s\n", [[err description] UTF8String]);
-        return;
-    }
-    printf("[WARN] No timestamp counter set available\n");
-}
-
-inline void metal_trace_begin() {
-    g_trace_enabled = true;
-    g_trace_idx = 0;
-}
-
+inline void metal_trace_init(Context&) {}
+inline void metal_trace_begin() { g_trace_enabled = true; g_cb_count = 0; }
 inline void metal_trace_end() { g_trace_enabled = false; }
+inline void metal_trace_sample() {}
+inline void metal_trace_label(const char* label) { g_trace_name = label; }
 
-inline void metal_trace_sample() {
-    // GPU counter sampling not supported on M1 compute encoders
+static inline void metal_trace_record(id<MTLCommandBuffer> cb) {
+    if (!g_trace_enabled || g_cb_count >= MAX_CBS) return;
+    g_cb_labels[g_cb_count] = g_trace_name;
+    g_cb_ms[g_cb_count] = (cb.GPUEndTime - cb.GPUStartTime) * 1000.0;
+    g_cb_count++;
 }
 
 inline void metal_trace_report() {
-    if (!g_trace_buf || g_trace_idx < 2) { printf("[TRACE] No GPU timing data\n"); return; }
-    NSData* res = [g_trace_buf resolveCounterRange:NSMakeRange(0, g_trace_idx)];
-    const uint64_t* data = (const uint64_t*)[res bytes];
-    printf("\n[GPU PER-KERNEL TIMING]\n");
-    double total_ns = 0;
-    for (int i = 0; i < g_trace_idx - 1; i++) {
-        double ns = (double)(data[i+1] - data[i]);
-        total_ns += ns;
-        printf("  %-25s %8.1f us\n", g_trace_names[i], ns / 1000.0);
+    if (g_cb_count == 0) { printf("[TRACE] No GPU timing data\n"); return; }
+    printf("\n[GPU PER-CB TIMING]\n");
+    double total_ms = 0;
+    for (int i = 0; i < g_cb_count; i++) {
+        total_ms += g_cb_ms[i];
+        printf("  %-25s %8.1f us\n", g_cb_labels[i] ? g_cb_labels[i] : "(null)", g_cb_ms[i] * 1000.0);
     }
-    printf("  %-25s %8.1f us  (%.2f ms)\n", "TOTAL", total_ns, total_ns / 1000000.0);
+    printf("  %-25s %8.1f us  (%.2f ms)\n", "TOTAL", total_ms * 1000.0, total_ms);
+    printf("  (%d command buffers traced)\n", g_cb_count);
 }
 
 inline void metal_batch_begin(Context& ctx, bool reset_offset = true) {
@@ -148,19 +122,27 @@ inline void metal_batch_begin(Context& ctx, bool reset_offset = true) {
 inline void metal_batch_commit() {
     if (g_batch_enc) { [g_batch_enc endEncoding]; g_batch_enc = nil; g_batch_pipe = nil; }
     if (g_batch_cb) {
-        [g_batch_cb commit];
         if (g_num_committed_cbs < MAX_CBS) {
-            g_committed_cbs[g_num_committed_cbs++] = g_batch_cb;
+            g_committed_cbs[g_num_committed_cbs] = g_batch_cb;
+            g_committed_labels[g_num_committed_cbs] = g_trace_name;
+            g_num_committed_cbs++;
         }
+        [g_batch_cb commit];
         g_batch_cb = nil;
     }
 }
 
-// Wait for all committed CBs and clear the list
+// Wait for all committed CBs, record GPU timings, and clear the list
 inline void metal_batch_wait_all() {
     for (int i = 0; i < g_num_committed_cbs; i++) {
         [g_committed_cbs[i] waitUntilCompleted];
+        if (g_trace_enabled && g_cb_count < MAX_CBS) {
+            g_cb_labels[g_cb_count] = g_committed_labels[i];
+            g_cb_ms[g_cb_count] = (g_committed_cbs[i].GPUEndTime - g_committed_cbs[i].GPUStartTime) * 1000.0;
+            g_cb_count++;
+        }
         g_committed_cbs[i] = nil;
+        g_committed_labels[i] = nullptr;
     }
     g_num_committed_cbs = 0;
 }
@@ -170,6 +152,11 @@ inline void metal_batch_end() {
     if (g_batch_cb) {
         [g_batch_cb commit];
         [g_batch_cb waitUntilCompleted];
+        if (g_trace_enabled && g_cb_count < MAX_CBS) {
+            g_cb_labels[g_cb_count] = g_trace_name;
+            g_cb_ms[g_cb_count] = (g_batch_cb.GPUEndTime - g_batch_cb.GPUStartTime) * 1000.0;
+            g_cb_count++;
+        }
         g_batch_cb = nil;
     }
     // Also flush any previously committed CBs (safety)
@@ -187,6 +174,51 @@ inline void metal_batch_ensure_encoder(Context& ctx, id<MTLComputePipelineState>
 
 // Dispatch a single matmul: into the current batch if one is active,
 // otherwise creates a standalone command buffer, commits, and waits.
+// Dispatch for simdgroup kernels (different threadgrid semantics)
+inline void metal_batch_dispatch_simd(
+    Context& ctx, id<MTLComputePipelineState> pipe,
+    int tg_x, int tg_y, int tg_z,
+    int rows, int cols,
+    const uint8_t* w_data, size_t w_bytes,
+    const float* x_data, float* y_data)
+{
+    bool batch_was_active = (g_batch_cb != nil || g_batch_enc != nil);
+    metal_batch_ensure_encoder(ctx, pipe);
+
+    auto wit = g_w_cache.find(w_data);
+    id<MTLBuffer> bufW;
+    if (wit != g_w_cache.end()) {
+        bufW = wit->second;
+    } else {
+        bufW = [ctx.device newBufferWithBytesNoCopy:(void*)w_data
+                length:w_bytes options:MTLStorageModeShared deallocator:nil];
+        g_w_cache[w_data] = bufW;
+    }
+
+    // For simdgroup, use the passed dimensions
+    id<MTLBuffer> bufX = [ctx.device newBufferWithBytesNoCopy:(void*)x_data
+                         length:(size_t)cols * 4 options:MTLStorageModeShared deallocator:nil];
+    id<MTLBuffer> bufY = [ctx.device newBufferWithBytesNoCopy:(void*)y_data
+                         length:(size_t)rows * 4 options:MTLStorageModeShared deallocator:nil];
+
+    if (!g_params_buf)
+        g_params_buf = [ctx.device newBufferWithLength:PARAMS_POOL_SIZE
+                         options:MTLStorageModeShared];
+    int slot = batch_was_active ? g_params_offset : 0;
+    if (batch_was_active) g_params_offset += 8;
+    int* params = (int*)((uint8_t*)[g_params_buf contents] + slot);
+    params[0] = rows;
+    params[1] = cols;
+
+    [g_batch_enc setBuffer:bufW offset:0 atIndex:0];
+    [g_batch_enc setBuffer:bufX offset:0 atIndex:1];
+    [g_batch_enc setBuffer:bufY offset:0 atIndex:2];
+    [g_batch_enc setBuffer:g_params_buf offset:slot atIndex:3];
+
+    [g_batch_enc dispatchThreads:MTLSizeMake(tg_x, tg_y, tg_z)
+             threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+}
+
 inline void metal_batch_dispatch(
     Context& ctx, id<MTLComputePipelineState> pipe,
     int rows, int cols,
@@ -257,6 +289,66 @@ kernel void mul_mat_fp32(device const float* A [[buffer(0)]],
     for (int j = 0; j < cols; j++)
         sum += A[(uint)gid * cols + j] * x[j];
     y[gid] = sum;
+}
+
+// ── Q8_0 simdgroup (hardware-accelerated) ───────────────────────────
+kernel void mul_mat_q8_0_simd(
+    device const uint8_t* W [[buffer(0)]],
+    device const float* x [[buffer(1)]],
+    device float* y [[buffer(2)]],
+    constant int* params [[buffer(3)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    int rows = params[0], cols = params[1];
+    int nb = cols / 32;
+    int r0 = tgpig.y * 8;
+    if (r0 >= rows) return;
+    int nr = (rows - r0) > 8 ? 8 : (rows - r0);
+    int group_k = tgpig.x * 16;
+    
+    threadgroup float sa[16 * 64];
+    threadgroup float sb[16 * 32];
+    
+    simdgroup_float8x8 acc;
+    simdgroup_float8x8 ma, mb;
+    ma = mb = make_filled_simdgroup_matrix<float, 8>(0.f);
+    acc = make_filled_simdgroup_matrix<float, 8>(0.f);
+    
+    for (int ib = group_k; ib < nb && ib < group_k + 16; ib++) {
+        // Load A into threadgroup
+        for (int i = 0; i < 16; i++) {
+            int row_offset = (r0 + i/2) * nb + ib;
+            if (row_offset < rows * nb) {
+                device const uchar* bp = W + (ulong)row_offset * 34;
+                half d = *(device const half*)bp;
+                for (int j = 0; j < 8; j++) {
+                    sa[i*64 + (i%2)*4 + j] = (float)d * (float)*(bp + 2 + j);
+                }
+            }
+        }
+        // Load B into threadgroup  
+        for (int i = 0; i < 8; i++) {
+            sb[i*32] = (ib * 32 + i < cols) ? x[ib * 32 + i] : 0.f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        
+        // matmul: load from threadgroup memory
+        threadgroup const float* lda = sa;
+        threadgroup const float* ldb = sb;
+        simdgroup_load(ma, lda, 8, 0, false);
+        simdgroup_load(mb, ldb, 8, 0, false);
+        simdgroup_multiply_accumulate(ma, mb, ma, acc);
+    }
+    
+    // Store accumulator
+    threadgroup float* tmp = sa + (sgitg & 1) * 32;
+    simdgroup_store(acc, tmp, 8, 0, false);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    
+    if (tiisg == 0) {
+        for (int i = 0; i < nr; i++) y[r0 + i] = tmp[i];
+    }
 }
 
 // ── Q8_0 (SIMD, 64-thread threadgroup, 2 SIMD groups × 2 rows) ──
@@ -696,6 +788,8 @@ inline bool init(Context& ctx) {
 
     ctx.pipe_fp32 = get_pipe("mul_mat_fp32");
     ctx.pipe_q8_0 = get_pipe("mul_mat_q8_0");
+    ctx.pipe_q8_0_simd = get_pipe("mul_mat_q8_0_simd");
+    if (ctx.pipe_q8_0_simd) printf("[METAL] Using simdgroup Q8_0 kernel\n");
     ctx.pipe_q5_0 = get_pipe("mul_mat_q5_0");
     ctx.pipe_q4_k = get_pipe("mul_mat_q4_k");
     ctx.pipe_q6_k = get_pipe("mul_mat_q6_k");
@@ -763,8 +857,17 @@ inline void capture_stop() {
 
 inline void matmul_q8_0(Context& ctx, int rows, int cols,
                         const uint8_t* w, const float* x, float* y) {
-    size_t wb = ((size_t)rows * cols + 31) / 32 * 34;
-    metal_batch_dispatch(ctx, ctx.pipe_q8_0, rows, cols, w, wb, x, y, true);
+    // Prefer simd kernel if available
+    if (ctx.pipe_q8_0_simd) {
+        int nb = cols / 32;
+        int tg_x = (nb + 15) / 16;
+        int tg_y = (rows + 7) / 8;
+        size_t wb = ((size_t)rows * cols + 31) / 32 * 34;
+        metal_batch_dispatch_simd(ctx, ctx.pipe_q8_0_simd, tg_x, tg_y, 1, rows, cols, w, wb, x, y);
+    } else {
+        size_t wb = ((size_t)rows * cols + 31) / 32 * 34;
+        metal_batch_dispatch(ctx, ctx.pipe_q8_0, rows, cols, w, wb, x, y, true);
+    }
 }
 
 inline void matmul_q5_0(Context& ctx, int rows, int cols,
