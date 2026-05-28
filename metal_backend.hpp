@@ -35,7 +35,8 @@ struct Context {
     id<MTLComputePipelineState> pipe_rmsnorm = nil;
     id<MTLComputePipelineState> pipe_fused_qkv_q5 = nil; // V=Q5_0
     id<MTLComputePipelineState> pipe_fused_qkv_q8 = nil; // V=Q8_0
-    id<MTLComputePipelineState> pipe_fused_ffn_gate_up = nil;
+    id<MTLComputePipelineState> pipe_fused_ffn_gate_up = nil;   // Q6_K version
+    id<MTLComputePipelineState> pipe_fused_ffn_gate_up_q5 = nil; // Q5_0 version
     bool initialized = false;
 };
 
@@ -605,7 +606,45 @@ kernel void kernel_fused_qkv(
         }
     }
 }
-// ── Fused FFN gate+up (both Q6_K, same dims) ──
+// ── Fused FFN gate+up Q5_0 (both Q5_0, same dims) ──
+kernel void kernel_fused_ffn_gate_up_q5(
+    device const uint8_t* W_gate [[buffer(0)]],
+    device const uint8_t* W_up [[buffer(1)]],
+    device const float* x [[buffer(2)]],
+    device float* y [[buffer(3)]],
+    constant int* params [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]) {
+    int rows_per = params[0]; int cols = params[1];
+    int total_rows = rows_per * 2;
+    int nb = cols / 32;
+    int lane = gid % 32;
+    int sg = (gid / 32) % 2;
+    int tgpig = gid / 64;
+    int first_row = tgpig * 4 + sg * 2;
+    if (first_row >= total_rows) return;
+    int nr = min(2, total_rows - first_row);
+    float sumf[2] = {0.f, 0.f};
+    for (int ib = 0; ib < nb; ib++) {
+        float xv = x[(uint)ib * 32 + lane];
+        for (int r = 0; r < nr; r++) {
+            int global_row = first_row + r;
+            device const uint8_t* W = global_row < rows_per ? W_gate : W_up;
+            int local_row = global_row < rows_per ? global_row : global_row - rows_per;
+            ulong base = ((ulong)local_row * nb + ib) * 22;
+            float d = (float)*(device const half*)(W + base);
+            uint qh = *(device const uint32_t*)(W + base + 2);
+            uint qs_byte = W[base + 6 + (lane & 15)];
+            uint ql = (qs_byte >> ((lane >> 4) * 4)) & 0xF;
+            int q = (int)((((qh >> lane) & 1) << 4) | ql) - 16;
+            sumf[r] += (float)q * d * xv;
+        }
+    }
+    for (int r = 0; r < nr; r++) {
+        float total = simd_sum(sumf[r]);
+        if (lane == 0) y[first_row + r] = total;
+    }
+}
+// ── Fused FFN gate+up Q6_K (both Q6_K, same dims) ──
 kernel void kernel_fused_ffn_gate_up(
     device const uint8_t* W_gate [[buffer(0)]],
     device const uint8_t* W_up [[buffer(1)]],
@@ -976,6 +1015,8 @@ inline bool init(Context& ctx) {
     }
     ctx.pipe_fused_ffn_gate_up = get_pipe("kernel_fused_ffn_gate_up");
     if (!ctx.pipe_fused_ffn_gate_up) return false;
+    ctx.pipe_fused_ffn_gate_up_q5 = get_pipe("kernel_fused_ffn_gate_up_q5");
+    if (!ctx.pipe_fused_ffn_gate_up_q5) return false;
     ctx.pipe_rope = get_pipe("kernel_rope");
     ctx.pipe_attn = get_pipe("kernel_attn");
     ctx.pipe_flash_attn = get_pipe("kernel_flash_attn");
@@ -1177,12 +1218,12 @@ inline void fused_qkv_op(Context& ctx,
 inline void fused_ffn_gate_up_op(Context& ctx,
                                   const uint8_t* W_gate, const uint8_t* W_up,
                                   const float* x, float* y,
-                                  int rows_per, int cols) {
-    id<MTLComputePipelineState> pipe = ctx.pipe_fused_ffn_gate_up;
+                                  int rows_per, int cols,
+                                  id<MTLComputePipelineState> pipe,
+                                  size_t wb_bytes) {
     metal_batch_ensure_encoder(ctx, pipe);
-    size_t wb = ((size_t)rows_per * cols + 255) / 256 * 210;
-    id<MTLBuffer> bufWg = wrap_buffer(ctx, W_gate, wb);
-    id<MTLBuffer> bufWu = wrap_buffer(ctx, W_up, wb);
+    id<MTLBuffer> bufWg = wrap_buffer(ctx, W_gate, wb_bytes);
+    id<MTLBuffer> bufWu = wrap_buffer(ctx, W_up, wb_bytes);
     id<MTLBuffer> bufX  = wrap_buffer(ctx, x, (size_t)cols * 4);
     id<MTLBuffer> bufY  = wrap_buffer(ctx, y, (size_t)rows_per * 2 * 4);
     int slot = g_params_offset; g_params_offset += 16;

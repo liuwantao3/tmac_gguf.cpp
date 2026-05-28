@@ -1525,17 +1525,39 @@ void forward_all_layers_fused(float* hidden, int pos) {
             { PROFILE_SCOPE("L12_ffn_norm");
               snprintf(name, 128, "blk.%d.ffn_norm.weight", layer);
               metal_backend::rmsnorm_op(g_mtl_ctx, scratch, (const float*)get_tensor_info(name)->data, HIDDEN_DIM); }
-            metal_backend::g_trace_name = "ffn_gate";
-            { PROFILE_SCOPE("L13_ffn_gate");
-              snprintf(name, 128, "blk.%d.ffn_gate.weight", layer);
-              matmul(get_tensor_info(name), scratch, gate_up, INTER_DIM, HIDDEN_DIM); }
-            metal_backend::g_trace_name = "ffn_up";
-            { PROFILE_SCOPE("L14_ffn_up");
-              snprintf(name, 128, "blk.%d.ffn_up.weight", layer);
-              matmul(get_tensor_info(name), scratch, gate_up + INTER_DIM, INTER_DIM, HIDDEN_DIM); }
-            metal_backend::g_trace_name = "silu";
-            { PROFILE_SCOPE("L15_silu");
-              metal_backend::elem_op(g_mtl_ctx, 1, gate_up, nullptr, INTER_DIM); }
+            snprintf(name, 128, "blk.%d.ffn_gate.weight", layer);
+            Tensor* t_gate = get_tensor_info(name);
+            snprintf(name, 128, "blk.%d.ffn_up.weight", layer);
+            Tensor* t_up = get_tensor_info(name);
+            if (t_gate && t_up) {
+                bool q6 = t_gate->type == TENSOR_Q6_K && t_up->type == TENSOR_Q6_K;
+                bool q5 = t_gate->type == TENSOR_Q5_0 && t_up->type == TENSOR_Q5_0;
+                if (q6) {
+                    metal_backend::g_trace_name = "ffn_gate_up_q6";
+                    metal_backend::fused_ffn_gate_up_op(g_mtl_ctx,
+                        t_gate->data, t_up->data,
+                        scratch, gate_up, INTER_DIM, HIDDEN_DIM,
+                        g_mtl_ctx.pipe_fused_ffn_gate_up,
+                        ((size_t)INTER_DIM * HIDDEN_DIM + 255) / 256 * 210);
+                } else if (q5) {
+                    metal_backend::g_trace_name = "ffn_gate_up_q5";
+                    metal_backend::fused_ffn_gate_up_op(g_mtl_ctx,
+                        t_gate->data, t_up->data,
+                        scratch, gate_up, INTER_DIM, HIDDEN_DIM,
+                        g_mtl_ctx.pipe_fused_ffn_gate_up_q5,
+                        ((size_t)INTER_DIM * HIDDEN_DIM + 31) / 32 * 22);
+                } else {
+                    goto fallback_ffn_fused;
+                }
+            } else {
+            fallback_ffn_fused:
+                metal_backend::g_trace_name = "ffn_gate";
+                matmul(t_gate, scratch, gate_up, INTER_DIM, HIDDEN_DIM);
+                metal_backend::g_trace_name = "ffn_up";
+                matmul(t_up, scratch, gate_up + INTER_DIM, INTER_DIM, HIDDEN_DIM);
+                metal_backend::g_trace_name = "silu";
+                metal_backend::elem_op(g_mtl_ctx, 1, gate_up, nullptr, INTER_DIM);
+            }
             metal_backend::g_trace_name = "ffn_down";
             { PROFILE_SCOPE("L16_ffn_down");
               snprintf(name, 128, "blk.%d.ffn_down.weight", layer);
@@ -1615,10 +1637,38 @@ void forward_and_logits_fused(float* hidden, float* logits, int pos) {
             metal_backend::g_trace_name = "ffn_rms";     metal_backend::rmsnorm_op(g_mtl_ctx, scratch,
                 (const float*)get_tensor_info(name)->data, HIDDEN_DIM);
             snprintf(name, 128, "blk.%d.ffn_gate.weight", layer);
-            metal_backend::g_trace_name = "ffn_gate";    matmul(get_tensor_info(name), scratch, gate_up, INTER_DIM, HIDDEN_DIM);
+            Tensor* t_gate = get_tensor_info(name);
             snprintf(name, 128, "blk.%d.ffn_up.weight", layer);
-            metal_backend::g_trace_name = "ffn_up";      matmul(get_tensor_info(name), scratch, gate_up + INTER_DIM, INTER_DIM, HIDDEN_DIM);
-            metal_backend::g_trace_name = "silu";        metal_backend::elem_op(g_mtl_ctx, 1, gate_up, nullptr, INTER_DIM);
+            Tensor* t_up = get_tensor_info(name);
+            if (t_gate && t_up) {
+                bool q6 = t_gate->type == TENSOR_Q6_K && t_up->type == TENSOR_Q6_K;
+                bool q5 = t_gate->type == TENSOR_Q5_0 && t_up->type == TENSOR_Q5_0;
+                if (q6) {
+                    metal_backend::g_trace_name = "ffn_gate_up_q6";
+                    metal_backend::fused_ffn_gate_up_op(g_mtl_ctx,
+                        t_gate->data, t_up->data,
+                        scratch, gate_up, INTER_DIM, HIDDEN_DIM,
+                        g_mtl_ctx.pipe_fused_ffn_gate_up,
+                        ((size_t)INTER_DIM * HIDDEN_DIM + 255) / 256 * 210);
+                } else if (q5) {
+                    metal_backend::g_trace_name = "ffn_gate_up_q5";
+                    metal_backend::fused_ffn_gate_up_op(g_mtl_ctx,
+                        t_gate->data, t_up->data,
+                        scratch, gate_up, INTER_DIM, HIDDEN_DIM,
+                        g_mtl_ctx.pipe_fused_ffn_gate_up_q5,
+                        ((size_t)INTER_DIM * HIDDEN_DIM + 31) / 32 * 22);
+                } else {
+                    goto fallback_ffn;
+                }
+            } else {
+            fallback_ffn:
+                metal_backend::g_trace_name = "ffn_gate";
+                matmul(t_gate, scratch, gate_up, INTER_DIM, HIDDEN_DIM);
+                metal_backend::g_trace_name = "ffn_up";
+                matmul(t_up, scratch, gate_up + INTER_DIM, INTER_DIM, HIDDEN_DIM);
+                metal_backend::g_trace_name = "silu";
+                metal_backend::elem_op(g_mtl_ctx, 1, gate_up, nullptr, INTER_DIM);
+            }
             snprintf(name, 128, "blk.%d.ffn_down.weight", layer);
             metal_backend::g_trace_name = "ffn_down";    matmul(get_tensor_info(name), gate_up, ffn_out, HIDDEN_DIM, INTER_DIM);
             metal_backend::g_trace_name = "residual2";   metal_backend::elem_op(g_mtl_ctx, 0, hidden, ffn_out, HIDDEN_DIM);

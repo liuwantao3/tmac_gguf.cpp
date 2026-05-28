@@ -199,26 +199,13 @@ Two pipelines created at init:
 
 ---
 
-## 4. Fused FFN Gate+Up Matmul — ✅ DONE, ❌ BROKEN
+## 4. Fused FFN Gate+Up Matmul — In Progress
 
 **llama.cpp:** `kernel_fused_ffn_silu_gate` — gate+up+silu+down in one kernel.
 
-**Our implementation:** `kernel_fused_ffn_gate_up` at `metal_backend.hpp:475-529` (gate+up only)
+**Our implementation:** `kernel_fused_ffn_gate_up` at `metal_backend.hpp:609-663` (Q6_K only, gate+up only)
 
-```metal
-kernel void kernel_fused_ffn_gate_up(
-    device const uint8_t* W_gate [[buffer(0)]],
-    device const uint8_t* W_up [[buffer(1)]],
-    device const float* x [[buffer(2)]],
-    device float* y [[buffer(3)]],
-    constant int* params [[buffer(4)]],
-    uint gid [[thread_position_in_grid]]) {
-    // Both W_gate and W_up are Q6_K, same dims
-    // Writes gate[0..INTER_DIM-1] and up[INTER_DIM..2*INTER_DIM-1]
-}
-```
-
-**Status:** Implemented but **BROKEN** — produces wrong tokens after first generation. Currently disabled (falls back to separate gate/up matmuls).
+Currently wired in `forward_and_logits_fused` for Q6_K FFN gate/up weights. However, Qwen2-0.5B uses Q5_0 for FFN gate/up — so a Q5_0 version of the fused kernel is being implemented.
 
 **Why silu+down can't be fused:**
 - silu needs the FULL gate and up results (not partial sums)
@@ -349,7 +336,7 @@ kernel void kernel_rmsnorm(device float* data [[buffer(0)]],
 
 Key insights from this study applicable to the FPGA accelerator:
 
-1. **Quantization diversity** — Model uses Q5_0 (attention), Q6_K (FFN gate/up), Q4_K (attn output), Q8_0 (embeddings). FPGA currently supports only Q8_0 and Q4_K. Adding Q5_0 and Q6_K would cover the largest layers.
+1. **Quantization diversity** — Model uses Q5_0 (attention Q/K/V, FFN gate/up), Q6_K (FFN down, half of layers), Q4_K (attn output, FFN down, half of layers), Q8_0 (embeddings). FPGA currently supports only Q8_0 and Q4_K. Adding Q5_0 and Q6_K would cover the largest layers.
 
 2. **Memory layout** — Q6_K uses 256-element blocks (matching GPU SIMD width). FPGA should align block sizes to AXI bus width for efficient transfers.
 

@@ -18,7 +18,9 @@ The companion FPGA project (`~/fpga`) implements a Zynq 7010 accelerator with Ve
 
 Quantized formats used:
 - **Q5_0**: attention Q/K/V weights
-- **Q6_K**: FFN gate/up weights (largest layers, 4864 × 896)
+- **Q5_0**: attention Q/K/V weights, FFN gate/up weights
+- **Q6_K**: FFN down weights (half of layers, 896 × 4864)
+- **Q4_K**: attention output projection, FFN down weights (half of layers)
 - **Q4_K**: attention output projection
 - **Q8_0**: token embeddings, output projection
 
@@ -30,7 +32,7 @@ Quantized formats used:
 - [x] **Fused QKV matmul** — single dispatch computes Q, K, V together (~6% speedup)
 - [x] Chrome trace profiling (`--perf`)
 - [x] CPU fallback path (verifies correctness)
-- [ ] Fused FFN gate+up matmul (implemented but buggy — disabled)
+- [x] **Fused FFN gate+up matmul** — single dispatch for Q5_0 gate+up (FFN gate/up are Q5_0 in Qwen2-0.5B)
 - [ ] Flash attention (studied but not implemented)
 
 ## Build
