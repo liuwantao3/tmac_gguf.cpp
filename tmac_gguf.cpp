@@ -206,6 +206,7 @@ static bool g_fpga_q8 = false;
 static bool g_fpga_q4k = false;
 static bool g_use_metal = false;
 static bool g_gpu_capture = false;
+static bool g_profile_wait = false;
 static bool g_use_metal_fused = false;
 static metal_backend::Context g_mtl_ctx;
 
@@ -436,7 +437,6 @@ Tensor* get_tensor_info(const char* name) {
     }
     return nullptr;
 }
-
 extern void q8_logits_matmul_with_tensor(const Tensor* emb_t, const float* x, float* y, int rows, int cols);
 
 // ===========================================================================
@@ -1796,6 +1796,7 @@ int main(int argc, char** argv) {
         printf("  --metal-fused: Use Metal GPU with single-command-buffer fused path (implies --metal)\n");
         printf("  --perf:       Enable pipeline profiling (Chrome trace JSON + bottleneck analysis)\n");
         printf("  --gpu-capture: Capture GPU trace to /tmp/capture.gputrace\n");
+        printf("  --profile-wait: Pause at startup — print PID, wait for Enter (for Xcode attach)\n");
         printf("  --dump-tiles N: Dump first N Q8 tiles for Verilog cosimulation\n");
         return 1;
     }
@@ -1822,6 +1823,7 @@ int main(int argc, char** argv) {
         if (strcmp(argv[i], "--perf") == 0) g_perf_enabled = true;
         if (strcmp(argv[i], "--perf-granular") == 0) { g_perf_enabled = true; g_perf_granular = true; }
         if (strcmp(argv[i], "--gpu-capture") == 0) g_gpu_capture = true;
+        if (strcmp(argv[i], "--profile-wait") == 0) g_profile_wait = true;
         if (strcmp(argv[i], "--dump-tiles") == 0 && i + 1 < argc) {
             int n = atoi(argv[++i]);
             if (n > 0) {
@@ -1851,6 +1853,13 @@ int main(int argc, char** argv) {
             }
             g_mtl_ctx_ptr = &g_mtl_ctx;
         }
+    }
+
+    if (g_profile_wait) {
+        printf("\n[PROFILE WAIT] PID: %d — Attach Xcode Instruments, then press Enter to continue...\n", getpid()); fflush(stdout);
+        FILE* tty = fopen("/dev/tty", "r");
+        if (tty) { fgetc(tty); fclose(tty); }
+        else { getchar(); }
     }
 
     std::vector<int> tokens;

@@ -2,6 +2,7 @@
 
 #ifdef __APPLE__
 #include <Metal/Metal.h>
+#include <simd/simd.h>
 #else
 typedef void* id;
 #define nil NULL
@@ -36,6 +37,7 @@ struct Context {
     id<MTLComputePipelineState> pipe_fused_qkv_q5 = nil; // V=Q5_0
     id<MTLComputePipelineState> pipe_fused_qkv_q8 = nil; // V=Q8_0
     id<MTLComputePipelineState> pipe_fused_ffn_gate_up_q5 = nil; // Q5_0 version
+
     bool initialized = false;
 };
 
@@ -643,7 +645,7 @@ kernel void kernel_fused_ffn_gate_up_q5(
         if (lane == 0) y[first_row + r] = total;
     }
 }
-//
+
 // ── Fused-pipeline kernels ──
 //
 
