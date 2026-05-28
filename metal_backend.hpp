@@ -35,7 +35,6 @@ struct Context {
     id<MTLComputePipelineState> pipe_rmsnorm = nil;
     id<MTLComputePipelineState> pipe_fused_qkv_q5 = nil; // V=Q5_0
     id<MTLComputePipelineState> pipe_fused_qkv_q8 = nil; // V=Q8_0
-    id<MTLComputePipelineState> pipe_fused_ffn_gate_up = nil;   // Q6_K version
     id<MTLComputePipelineState> pipe_fused_ffn_gate_up_q5 = nil; // Q5_0 version
     bool initialized = false;
 };
@@ -644,62 +643,6 @@ kernel void kernel_fused_ffn_gate_up_q5(
         if (lane == 0) y[first_row + r] = total;
     }
 }
-// ── Fused FFN gate+up Q6_K (both Q6_K, same dims) ──
-kernel void kernel_fused_ffn_gate_up(
-    device const uint8_t* W_gate [[buffer(0)]],
-    device const uint8_t* W_up [[buffer(1)]],
-    device const float* x [[buffer(2)]],
-    device float* y [[buffer(3)]],
-    constant int* params [[buffer(4)]],
-    uint gid [[thread_position_in_grid]]) {
-    int rows_per = params[0]; int cols = params[1];
-    int total_rows = rows_per * 2;
-    int nb = (cols + 255) / 256;
-    int lane = gid % 32;
-    int sg = (gid / 32) % 2;
-    int tgpig = gid / 64;
-    int first_row = tgpig * 4 + sg * 2;
-    if (first_row >= total_rows) return;
-    int nr = min(2, total_rows - first_row);
-    uint pos = lane * 8;
-    uint hf = pos / 128;
-    uint pos_in_half = pos % 128;
-    uint sub = pos_in_half / 32;
-    uint l_beg = pos_in_half % 32;
-    uint is = l_beg / 16;
-    float sumf[2] = {0.f, 0.f};
-    for (int ib = 0; ib < nb; ib++) {
-        ulong x_ofs = (ulong)ib * 256 + pos;
-        float xv[8];
-        int k_lim = 8;
-        if (ib == nb - 1) {
-            int rem = cols - ib * 256 - (int)pos;
-            k_lim = rem < 8 ? max(0, rem) : 8;
-        }
-        for (int k = 0; k < k_lim; k++) xv[k] = x[x_ofs + k];
-        for (int r = 0; r < nr; r++) {
-            int global_row = first_row + r;
-            device const uint8_t* W = global_row < rows_per ? W_gate : W_up;
-            int local_row = global_row < rows_per ? global_row : global_row - rows_per;
-            ulong base = ((ulong)local_row * nb + ib) * 210;
-            float d = (float)*(device const half*)(W + base + 208);
-            device const uint8_t* ql = W + base + hf * 64 + l_beg + (sub & 1) * 32;
-            device const uint8_t* qh = W + base + 128 + hf * 32 + l_beg;
-            int scale = (int)*(device const int8_t*)(W + base + 192 + hf * 8 + is + sub * 2);
-            for (int k = 0; k < k_lim; k++) {
-                uint ql_byte = ql[k];
-                uint ql_nib = (ql_byte >> (((sub >> 1) & 1) * 4)) & 0xF;
-                uint qh_bits = (qh[k] >> (sub * 2)) & 0x3;
-                int q6 = (int)((qh_bits << 4) | ql_nib) - 32;
-                sumf[r] += (float)scale * (float)q6 * d * xv[k];
-            }
-        }
-    }
-    for (int r = 0; r < nr; r++) {
-        float total = simd_sum(sumf[r]);
-        if (lane == 0) y[first_row + r] = total;
-    }
-}
 //
 // ── Fused-pipeline kernels ──
 //
@@ -1013,8 +956,6 @@ inline bool init(Context& ctx) {
         ctx.pipe_fused_qkv_q8 = make_qkv(1);
         if (!ctx.pipe_fused_qkv_q5 || !ctx.pipe_fused_qkv_q8) return false;
     }
-    ctx.pipe_fused_ffn_gate_up = get_pipe("kernel_fused_ffn_gate_up");
-    if (!ctx.pipe_fused_ffn_gate_up) return false;
     ctx.pipe_fused_ffn_gate_up_q5 = get_pipe("kernel_fused_ffn_gate_up_q5");
     if (!ctx.pipe_fused_ffn_gate_up_q5) return false;
     ctx.pipe_rope = get_pipe("kernel_rope");
