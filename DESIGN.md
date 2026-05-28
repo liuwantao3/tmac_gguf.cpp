@@ -304,17 +304,17 @@ The key insight: `metal_batch_ensure_encoder` already handles pipe switching wit
 
 | Kernel | TGs | Threads/TG | SIMDgroups | Threadgroup Mem |
 |--------|:---:|:----------:|:----------:|:---------------:|
-| Q5_0 matmul | ceil(rows/16) | 256 | 8 | 0 |
-| Q8_0 matmul | ceil(rows/16) | 256 | 8 | 0 |
-| Q6_K matmul | ceil(rows/16) | 256 | 8 | 0 |
-| Q4_K matmul | ceil(rows/16) | 256 | 8 | 0 |
-| add_bias | 1 (or ceil(dim/256)) | 256 | - | 0 |
-| rope | 1 (or ceil(threads/256)) | 256 | - | 0 |
-| cache_write | 1 | 256 | - | 0 |
+| Q5_0 matmul | ceil(rows/16) | 64 | 2 | 0 |
+| Q8_0 matmul | ceil(rows/16) | 64 | 2 | 0 |
+| Q6_K matmul | ceil(rows/16) | 64 | 2 | 0 |
+| Q4_K matmul | ceil(rows/16) | 64 | 2 | 0 |
+| add_bias | 1 (or ceil(dim/64)) | 64 | - | 0 |
+| rope | 1 (or ceil(threads/64)) | 64 | - | 0 |
+| cache_write | 1 | 64 | - | 0 |
 | attention | 14 | 32 | 1 | 1KB (scores) |
-| residual_add | 1 (or ceil(dim/256)) | 256 | - | 0 |
+| residual_add | 1 (or ceil(dim/64)) | 64 | - | 0 |
 | rmsnorm | 1 | 32 | 1 | 0 (register only) |
-| silu_x_up | 1 (or ceil(dim/256)) | 256 | - | 0 |
+| silu_x_up | 1 (or ceil(dim/64)) | 64 | - | 0 |
 
 ---
 

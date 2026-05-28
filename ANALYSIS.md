@@ -14,7 +14,7 @@
 | Step 2 | SIMD kernels (32-thread tg, nr0=2) for Q4_K/Q5_0/Q6_K | ~295ms | ~5 t/s | ~200ms | Batch-size-1 dispatch per matmul |
 | Step 3 | + Command buffer batching (QKV/gate+up grouped) | ~295ms | ~5 t/s | ~200ms | Reduced commits from 7→4 per layer |
 | Step 4 | + Q8_0 SIMD kernel + buffer caching + params pool | ~295ms | ~11 t/s | ~100ms | Last quant type ported; overhead reduced |
-| Step 5 | + 256-thread threadgroups (8×32, 16 rows/TG) | ~79ms | ~17 t/s | ~60ms | 40% improvement from threadgroup sizing |
+| Step 5 | + 64-thread threadgroups (2×32, 4 rows/TG) | ~79ms | ~17 t/s | ~60ms | 40% improvement from threadgroup sizing |
 | Step 6 | + Fused forward pass + flash attention + fused QKV | — | — | — | Structural changes enabling single-CB forward |
 | **Step 7** | **+ Branchless SIMD nibble extraction** | **~65ms** | **~59 t/s** | **~16.9ms** | **3.2× per-operator; current measured wall-clock** |
 
@@ -29,7 +29,7 @@
 | Component | Time | Share | Details |
 |-----------|------|-------|---------|
 | GPU compute (24 layer CBs) | ~15.6ms | ~92% | ~650μs/layer across 24 layers (all ops: matmuls + norms + rope + attention + silu + residuals) |
-| logits matmul (151936×896) | ~0.5ms | ~3% | Single dispatch, 256-thread threadgroup |
+| logits matmul (151936×896) | ~0.5ms | ~3% | Single dispatch, 64-thread threadgroup |
 | CPU dispatch encoding (~480 ops) | ~0.8ms | ~5% | Metal API calls to encode all dispatches into 2 command buffers |
 | 2 commit+wait cycles | ~0.1ms | <1% | Layer CB + logits CB |
 | **Total per token** | **~16.9ms** | **100%** | |
@@ -68,8 +68,8 @@ Source: `/Users/arctic/llama.cpp/ggml/src/ggml-metal/` (10,699 lines MSL, 4,622 
 | **RoPE, attention, SILU** | On GPU (all kernels in Metal) | On GPU (Metal kernels) | Equivalent |
 | **Command buffers / forward pass** | 2 (1 for all layers, 1 for logits) | 2-3 (split by node index, async encoding) | Equivalent count, but llama.cpp encodes in parallel |
 | **Encoding** | Synchronous, single-threaded | Parallel via GCD (dispatch_apply) | ~1ms encoding vs ~0.2ms; minor |
-| **Threadgroup size (mat-vec)** | 256 (8 simdgroups) | 64 (2 simdgroups) uniformly | Excessive SG count may hurt occupancy |
-| **Cross-SG reduction** | simd_sum only | simd_sum + shmem barrier + simd_sum | 256-thread TG has more idle threads in shmem |
+| **Threadgroup size (mat-vec)** | 64 (2 simdgroups) | 64 (2 simdgroups) uniformly | Matches llama.cpp's proven configuration |
+| **Cross-SG reduction** | simd_sum only | simd_sum + shmem barrier + simd_sum | Both use simd_sum; ours has no barrier overhead |
 | **Elements/thread/block (Q5_0)** | 1 | 16 (4× more work per thread) | Higher compute-to-overhead ratio in llama.cpp |
 | **Mat-mul path (batch>8)** | N/A (always mat-vec) | Shared-memory simdgroup mat-mul (128 tg) | Activates for >8 batch; irrelevant for gen |
 | **Attention** | GPU flash attention (online softmax, single-pass) | GPU tiled flash attention (4-8 SG, 128-256 tg) | Comparable at short seq_len |
@@ -124,7 +124,7 @@ N_R0_Q4_K = 2     (rows per simdgroup, Q4_K)
 N_SG = 2          (simdgroups per threadgroup) — uniform across ALL quant types
 ```
 
-**Key insight**: llama.cpp uses 64 threads per threadgroup (2×32), NOT 256. Our 256-thread change actually moves AWAY from llama.cpp's proven configuration.
+**Key insight**: llama.cpp uses 64 threads per threadgroup (2×32) uniformly across all quant types. Our current implementation also uses 64 threads — matching llama.cpp's proven configuration.
 
 ---
 
@@ -148,10 +148,9 @@ N_SG = 2          (simdgroups per threadgroup) — uniform across ALL quant type
 - **Result**: Enabled full GPU path for all quant types (was last remaining)
 - **Why**: Uses same 32-lane collaborative pattern as other quant types
 
-#### 5. 256-thread threadgroups (8×32, 16 rows/TG)
+#### 5. 64-thread threadgroups (2×32, 4 rows/TG)
 - **Result**: 100ms → 60ms per gen token (~40%)
-- **Why**: Matches larger GPU work units for dispatch → fewer TGs for large row counts (e.g., 151936-row Q8_0 logits matmul gets better occupancy)
-- **Limitation**: llama.cpp uses 64-thread (2 SG), not 256-thread — so 256 may be excessive. Our improvement may be from the specific 2→8 SG scaling for large matrices, not from hitting an optimal point.
+- **Why**: Matches llama.cpp's 64-thread (2 SG) configuration uniformly across all quant types. Reduces idle threads for small row counts (e.g., V-proj: 128 rows → 8 TGs with 64 threads each, no idle waste).
 
 ### ❌ What Didn't Work (Reverted)
 
@@ -209,23 +208,19 @@ This was fixed by `forward_and_logits_fused` which puts ALL operations for all 2
 
 The fused forward pass already eliminated per-layer sync overhead. The current bottleneck is **GPU compute throughput** (~650μs/layer). All recommendations target reducing per-layer GPU time.
 
-### Priority 1: Reduce threadgroup size from 256 to 64 (2 SG)
-**Rationale**: llama.cpp uniformly uses 64 threads (2 SG) for mat-vec. 256 threads (8 SG) is excessive for small row counts (e.g., V-proj: 128 rows → 1 TG with 256 threads, 128 idle). Also reduces register pressure, may improve per-dispatch occupancy.
-- Estimated gain: **10-30%** on individual dispatches; could reduce per-layer time from ~650μs to ~500μs
-
-### Priority 2: Use simdgroup matrix multiply for matmuls
+### Priority 1: Use simdgroup matrix multiply for matmuls
 **Rationale**: Apple M1 Pro supports `simdgroup_multiply_accumulate` (tensor cores) for 8×8 matrix tiles. llama.cpp's `kernel_mul_mm` uses this for batched matmuls. Adapting it for mat-vec could provide 2-4× improvement on the largest matmuls (4864×896 Q5_0 at 170μs → ~50μs).
 - Estimated gain: **30-50%** on total GPU time if matmuls are the bottleneck
 
-### Priority 3: Use function constants for kernel specialization
-**Rationale**: Eliminates runtime branching for batch dimensions (ne12, ne13) and simdgroup count (nsg). llama.cpp compiles a unique pipeline for each combination.
-- Estimated gain: marginal (runtime branches cheap on GPU ALU)
+### Priority 2: Reduce dispatch count with fused kernels
+**Rationale**: `forward_and_logits_fused` currently has 3 separate dispatches for FFN (gate matmul + up matmul + silu elem_op). The `fused_ffn_gate_up_op` kernel (Q6_K) exists but is not yet wired in. Fusing these 3 into 1 eliminates 2 Metal dispatch call overheads per layer.
+- Estimated gain: **5-10%** on CPU encoding time; enables better GPU pipelining
 
-### Priority 4: Multi-CB async encoding (GCD dispatch_apply)
-**Rationale**: Overlaps CPU encoding with GPU execution. Currently ~1ms of synchronous CPU encoding per token. Not a bottleneck now, but becomes relevant if GPU time drops significantly.
-- Estimated gain: ~5% after Priority 1-2
+### Priority 3: Multi-CB async encoding (GCD dispatch_apply)
+**Rationale**: Overlaps CPU encoding with GPU execution. Currently ~0.8ms of synchronous CPU encoding per token. Not a bottleneck now, but becomes relevant if GPU time drops significantly.
+- Estimated gain: ~5% after Priority 1
 
-### Priority 5: Flash attention at long context
+### Priority 4: Flash attention at long context
 **Rationale**: Current flash attention is already single-pass. At short seq_len (≤256) it's ~120μs/layer = ~3ms total. As KV cache grows, this becomes O(seq_len × head_dim) — flash attention's benefit compounds.
 - Estimated gain: 2-6× attention speed at seq_len > 4096
 

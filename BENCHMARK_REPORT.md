@@ -74,7 +74,7 @@ Branchless SIMD kernels stabilize after ~12 GPU dispatches:
 | Aspect | tmac_gguf | llama.cpp |
 |--------|-----------|-----------|
 | **Command buffers / forward** | 2 (1 layers + 1 logits) | 2-3 |
-| **Threadgroup size (mat-vec)** | 256 (8 SG) | 64 (2 SG) |
+| **Threadgroup size (mat-vec)** | 64 (2 SG) | 64 (2 SG) |
 | **Elements/thread/block (Q5_0)** | 1 | 16 |
 | **Attention** | Flash attention (GPU, single-pass) | Flash attention (GPU, tiled) |
 | **Cross-SG reduction** | simd_sum | simd_sum + shmem + simd_sum |
