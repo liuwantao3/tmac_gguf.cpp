@@ -1453,7 +1453,6 @@ void forward_all_layers(float* hidden, int pos) {
 // ── Fused all-GPU forward pass (one command buffer, zero CPU sync) ──
 void forward_all_layers_fused(float* hidden, int pos) {
     PROFILE_SCOPE("forward_all_layers_fused");
-    fprintf(stderr, "[PERF] forward_all_layers_fused pos=%d\n", pos);
 
     // Static buffers so wrap_buffer gets stable pointers
     static float scratch[HIDDEN_DIM];
@@ -1570,7 +1569,7 @@ void forward_and_logits_fused(float* hidden, float* logits, int pos) {
     metal_backend::g_params_offset = 0;
 
     // Chunk layers: per-layer profiling when --perf
-    int layer_cb_size = g_perf_enabled ? 1 : 3;
+    int layer_cb_size = g_perf_enabled ? 1 : NUM_LAYERS;
     for (int layer_start = 0; layer_start < NUM_LAYERS; layer_start += layer_cb_size) {
         metal_backend::metal_batch_begin(g_mtl_ctx, false);
 
@@ -1850,7 +1849,14 @@ int main(int argc, char** argv) {
                 sleep(1);
             }
         }
-        generate(hidden, logits, (int)tokens.size(), generate_n, 40);
+        {
+            auto t0 = std::chrono::high_resolution_clock::now();
+            generate(hidden, logits, (int)tokens.size(), generate_n, 40);
+            auto t1 = std::chrono::high_resolution_clock::now();
+            double total_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            printf("\n[BENCH] Generated %d tokens in %.1f ms — %.1f ms/tok, %.0f tok/s\n",
+                   generate_n, total_ms, total_ms / generate_n, generate_n / (total_ms / 1000.0));
+        }
         if (g_gpu_capture) {
             metal_backend::capture_stop();
             printf("[GPU CAPTURE] Done. Check Xcode for the captured frame.\n");

@@ -15,32 +15,45 @@
 | Step 3 | + Command buffer batching (QKV/gate+up grouped) | ~295ms | ~5 t/s | ~200ms | Reduced commits from 7→4 per layer |
 | Step 4 | + Q8_0 SIMD kernel + buffer caching + params pool | ~295ms | ~11 t/s | ~100ms | Last quant type ported; overhead reduced |
 | Step 5 | + 256-thread threadgroups (8×32, 16 rows/TG) | ~79ms | ~17 t/s | ~60ms | 40% improvement from threadgroup sizing |
-| Step 6 | + Branchless SIMD nibble extraction (Q5_0/Q4_K/Q6_K, fused kernels) | ~6ms | ~150 t/s | ~6.6ms | 3.2× per-operator; eliminates SIMD divergence |
+| Step 6 | + Fused forward pass + flash attention + fused QKV | — | — | — | Structural changes enabling single-CB forward |
+| **Step 7** | **+ Branchless SIMD nibble extraction** | **~65ms** | **~59 t/s** | **~16.9ms** | **3.2× per-operator; current measured wall-clock** |
 
-**Current total time**: ~6.6ms/token (steady-state), ~30% faster than llama.cpp (9.23ms/token) on M1 Pro.
+**Current total time**: **16.9 ms/token** (59 tok/s) — measured wall-clock via `[BENCH]` timer, M1 Pro, 30 gen tokens, fused single-CB forward pass, no `--perf` overhead.
 
 ---
 
-## 2. The Real Bottleneck: Overhead Analysis
+## 2. Current Bottleneck Analysis
 
-### Current profile breakdown (forward pass, 3 gen tokens)
+### Measured profile breakdown (per generation token, fused single-CB path)
 
-| Category | Time | Share | Details |
-|----------|------|-------|---------|
-| Quantized matmuls (GPU) | ~10ms | ~7% | 6 matmuls × 24 layers × 3 tokens = 432 dispatches |
-| CPU ops (rope, attn, silu, norms) | ~5ms | ~3% | Element-wise, trivially parallel |
-| **Sync + dispatch overhead** | **~136ms** | **~90%** | 96 commit+wait cycles, encoder creation, buffer binding |
-| **Total forward_all_layers** | **~151ms** | **100%** | |
+| Component | Time | Share | Details |
+|-----------|------|-------|---------|
+| GPU compute (24 layer CBs) | ~15.6ms | ~92% | ~650μs/layer across 24 layers (all ops: matmuls + norms + rope + attention + silu + residuals) |
+| logits matmul (151936×896) | ~0.5ms | ~3% | Single dispatch, 256-thread threadgroup |
+| CPU dispatch encoding (~480 ops) | ~0.8ms | ~5% | Metal API calls to encode all dispatches into 2 command buffers |
+| 2 commit+wait cycles | ~0.1ms | <1% | Layer CB + logits CB |
+| **Total per token** | **~16.9ms** | **100%** | |
 
-Each sync point (commit + waitUntilCompleted) costs ~1.4ms of GPU idle + CPU overhead. 4 sync points per layer × 24 layers = 96 sync points per forward pass. **This is the single largest performance problem — 90% of time spent not computing.**
+**The bottleneck is GPU compute throughput.** There is no hidden 90% overhead — the fused forward pass (single CB for all 24 layers) eliminated the per-layer synchronous commit+wait cycles that plagued the earlier non-fused path. Each layer's ~650μs GPU time is spent executing ~20 dispatches (matmuls, norms, rope, attention, residuals) sequentially in one command buffer.
 
 ### Bandwidth utilization
 
 - Model weight size: 374 MB (all quant tensors)
 - M1 Pro peak bandwidth: 200 GB/s
 - Theoretical minimum to read all weights: 374 MB / 200 GB/s = **1.9ms**
-- Actual time per token: ~**60ms**
-- Bandwidth utilization: **~3%**
+- Actual GPU time: **~16.1ms** (24 layers × ~650μs + logits ~530μs)
+- Bandwidth utilization: **~12%**
+
+### Why per-layer GPU time is ~650μs
+
+Each layer executes ~20 dispatches in sequence (no overlap — each op's output feeds the next):
+
+| Op type | Count per layer | Typical GPU time |
+|---------|:--------------:|:----------------:|
+| Quant matmuls (Q, K, V, attn_out, gate, up, down) | 7 | ~330μs (fused QKV ≈ 67μs, attn_out ≈ 67μs, gate+up ≈ 170μs combined, down ≈ 170μs) |
+| Element-wise (copy, norm×2, bias×3, rope×2, silu, residual×2, KV cache×2) | ~13 | ~200μs |
+| Attention (flash, seq_len=4) | 1 | ~120μs |
+| **Total per layer** | **~21** | **~650μs** |
 
 ---
 
@@ -50,16 +63,16 @@ Source: `/Users/arctic/llama.cpp/ggml/src/ggml-metal/` (10,699 lines MSL, 4,622 
 
 ### 3.1 Key Architectural Differences
 
-| Aspect | Our Implementation | llama.cpp | Impact |
-|--------|-------------------|-----------|--------|
-| **RoPE, attention, SILU** | On CPU (creates sync points) | On GPU (Metal kernels) | **Critical**: forcing 4 sync points per layer vs 0 |
-| **Command buffers / forward pass** | 96 (one per batch, commit+wait each) | 2-3 (split by node index, async encoding) | **Critical**: 96× GPU drain vs 2-3× |
-| **Encoding** | Synchronous, single-threaded | Parallel via GCD (dispatch_apply) | Reduces CPU encoding latency |
-| **Threadgroup size (mat-vec)** | 256 (8 simdgroups) | 64 (2 simdgroups) uniformly | Excessive SG count hurts occupancy |
-| **Cross-SG reduction** | simd_sum only | simd_sum + shmem barrier + simd_sum | More threads idle in large TG |
-| **Elements/thread/block (Q5_0)** | 1 | 16 (4× more work per thread) | Much lower compute-to-overhead ratio |
+| Aspect | Our Implementation (current) | llama.cpp | Impact |
+|--------|---------------------------|-----------|--------|
+| **RoPE, attention, SILU** | On GPU (all kernels in Metal) | On GPU (Metal kernels) | Equivalent |
+| **Command buffers / forward pass** | 2 (1 for all layers, 1 for logits) | 2-3 (split by node index, async encoding) | Equivalent count, but llama.cpp encodes in parallel |
+| **Encoding** | Synchronous, single-threaded | Parallel via GCD (dispatch_apply) | ~1ms encoding vs ~0.2ms; minor |
+| **Threadgroup size (mat-vec)** | 256 (8 simdgroups) | 64 (2 simdgroups) uniformly | Excessive SG count may hurt occupancy |
+| **Cross-SG reduction** | simd_sum only | simd_sum + shmem barrier + simd_sum | 256-thread TG has more idle threads in shmem |
+| **Elements/thread/block (Q5_0)** | 1 | 16 (4× more work per thread) | Higher compute-to-overhead ratio in llama.cpp |
 | **Mat-mul path (batch>8)** | N/A (always mat-vec) | Shared-memory simdgroup mat-mul (128 tg) | Activates for >8 batch; irrelevant for gen |
-| **Attention** | CPU dot product + softmax | GPU tiled flash attention (4-8 SG, 128-256 tg) | Eliminates sync; scales with KV cache |
+| **Attention** | GPU flash attention (online softmax, single-pass) | GPU tiled flash attention (4-8 SG, 128-256 tg) | Comparable at short seq_len |
 | **Kernel specialization** | Runtime branching on params | Function constants (compile-time) | Marginal; runtime branches cheap on GPU |
 
 ### 3.2 llama.cpp Kernel Organization (ggml-metal.metal)
@@ -159,9 +172,9 @@ N_SG = 2          (simdgroups per threadgroup) — uniform across ALL quant type
 
 ---
 
-## 5. Root Cause Analysis: Why 90% Overhead?
+## 5. Why the Old Code Was 90% Overhead (Historical)
 
-### The sync chain (per layer)
+The earlier non-fused path (`forward_all_layers` + CPU ops) used per-layer synchronous commit+wait cycles:
 
 ```
 metal_batch_begin()
@@ -172,62 +185,49 @@ metal_batch_end()      [COMMIT + WAIT ~1.4ms] ← GPU idle, CPU blocks
 rope/attention (CPU)   [CPU, ~11μs]
 metal_batch_begin()
   attn_out dispatch    [GPU, ~24μs]
-metal_batch_end()      [COMMIT + WAIT ~1.4ms] ← GPU idle, CPU blocks
-silu (CPU)             [CPU, ~11μs]
-metal_batch_begin()
-  gate dispatch        [GPU, ~22μs]
-  up dispatch          [GPU, ~13μs]
-metal_batch_end()      [COMMIT + WAIT ~1.4ms] ← GPU idle, CPU blocks
-metal_batch_begin()
-  ffn_down dispatch    [GPU, ~24μs]
-metal_batch_end()      [COMMIT + WAIT ~1.4ms] ← GPU idle, CPU blocks
+metal_batch_end()      [COMMIT + WAIT ~1.4ms]
+...
 ```
 
-**Each commit+wait cycle:**
-1. `endEncoding` — marks encoder done (~5μs)
-2. `commit` — submits command buffer to GPU (~10μs)
-3. `waitUntilCompleted` — blocks CPU until GPU finishes all work in buffer (~1.4ms GPU idle!)
-
-**Why so expensive?** GPU has startup latency per command buffer (scheduling, cache warm, power-up). With only 50μs of actual work per batch, the GPU spends 96% of the time on startup overhead.
+This was fixed by `forward_and_logits_fused` which puts ALL operations for all 24 layers into 2 command buffers (1 for layers, 1 for logits). The current code no longer has this bottleneck.
 
 ### Theoretical minimum per token
 
 | Component | Time | Assumptions |
 |-----------|------|-------------|
 | Read 374 MB weights at 200 GB/s | 1.9ms | Bandwidth-saturating kernel |
-| Attention (softmax Q·K^T·V, CPU) | ~0.3ms | For short context |
+| Attention (GPU flash) | ~0.3ms | Short context (seq_len≤256) |
 | Element-wise ops (rope, silu, norms) | ~0.1ms | 896 hidden dim, trivial |
-| GPU dispatch overhead (amortized) | ~0.5ms | 1 command buffer, ~50 dispatches |
+| GPU dispatch overhead (amortized) | ~0.5ms | 2 command buffers, ~480 dispatches |
 | **Theoretical minimum** | **~2.8ms** | **≈ 357 t/s** |
 
-Current gap from theoretical: **60ms / 2.8ms = 21×**
+**Measured gap from theoretical**: **16.9ms / 2.8ms = 6×** — mostly because matmuls are sequential within each layer (data dependencies prevent parallel execution on 16 GPU cores).
 
 ---
 
 ## 6. Recommendations: Next Steps (Ranked by Impact)
 
-### Priority 1: Move CPU ops to GPU (RoPE, attention, SILU) → Single CB forward pass
-**Rationale**: Eliminates 3 sync points per layer (72/96 = 75% of overhead).
-- Write 3 simple Metal kernels (~100 lines total)
-- Encode ALL operations for ALL 24 layers into ONE command buffer
-- Zero commit+wait cycles during forward pass
-- Estimated gain: **60ms → ~10ms per token** (6×)
+The fused forward pass already eliminated per-layer sync overhead. The current bottleneck is **GPU compute throughput** (~650μs/layer). All recommendations target reducing per-layer GPU time.
 
-### Priority 2: Reduce threadgroup size from 256 to 64 (2 SG)
-**Rationale**: llama.cpp uniformly uses 64 threads (2 SG) for mat-vec. 256 threads (8 SG) is excessive for small row counts (e.g., V-proj: 128 rows → 1 TG with 256 threads, 128 idle). Also reduces register pressure.
-- Estimated gain: marginal alone, but compounds with Priority 1
+### Priority 1: Reduce threadgroup size from 256 to 64 (2 SG)
+**Rationale**: llama.cpp uniformly uses 64 threads (2 SG) for mat-vec. 256 threads (8 SG) is excessive for small row counts (e.g., V-proj: 128 rows → 1 TG with 256 threads, 128 idle). Also reduces register pressure, may improve per-dispatch occupancy.
+- Estimated gain: **10-30%** on individual dispatches; could reduce per-layer time from ~650μs to ~500μs
+
+### Priority 2: Use simdgroup matrix multiply for matmuls
+**Rationale**: Apple M1 Pro supports `simdgroup_multiply_accumulate` (tensor cores) for 8×8 matrix tiles. llama.cpp's `kernel_mul_mm` uses this for batched matmuls. Adapting it for mat-vec could provide 2-4× improvement on the largest matmuls (4864×896 Q5_0 at 170μs → ~50μs).
+- Estimated gain: **30-50%** on total GPU time if matmuls are the bottleneck
 
 ### Priority 3: Use function constants for kernel specialization
 **Rationale**: Eliminates runtime branching for batch dimensions (ne12, ne13) and simdgroup count (nsg). llama.cpp compiles a unique pipeline for each combination.
 - Estimated gain: marginal (runtime branches cheap on GPU ALU)
 
 ### Priority 4: Multi-CB async encoding (GCD dispatch_apply)
-**Rationale**: Overlaps CPU encoding with GPU execution. Important only after sync points are eliminated (Priority 1).
-- Estimated gain: 5-10% after Priority 1 is done
+**Rationale**: Overlaps CPU encoding with GPU execution. Currently ~1ms of synchronous CPU encoding per token. Not a bottleneck now, but becomes relevant if GPU time drops significantly.
+- Estimated gain: ~5% after Priority 1-2
 
-### Priority 5: Flash attention on GPU (full tiled)
-**Rationale**: Our current attention is basic Q·K^T·V with softmax. As KV cache grows, this will become a bottleneck. Flash attention scales sub-linearly.
-- Estimated gain: Important for long context, irrelevant for short gen
+### Priority 5: Flash attention at long context
+**Rationale**: Current flash attention is already single-pass. At short seq_len (≤256) it's ~120μs/layer = ~3ms total. As KV cache grows, this becomes O(seq_len × head_dim) — flash attention's benefit compounds.
+- Estimated gain: 2-6× attention speed at seq_len > 4096
 
 ---
 
@@ -302,13 +302,76 @@ Additionally:
 | ffn_down | Q4_K | 4864×896 | 575 µs | 170 µs | **3.4×** |
 | Q4_K scale branch | Q4_K | — | within noise | within noise | ~3% |
 
-### Wall-Clock Impact
-- **tmac_gguf**: **6.6 ms/token** (after warmup)
-- **llama.cpp**: **9.23 ms/token** (M1 Pro, same model)
-- **tmac_gguf ~30% faster**
+### End-to-End Measured Results
 
-### Why the Speedup Is Real but Requires Warmup
-The first 3-4 passes show old speed (552 µs); steady state (pass 12+) reaches 170 µs. This is GPU instruction/cache warmup — the branchless code gets cached in the GPU's instruction cache, and the SIMD pipeline fills optimally after a few dispatches.
+First wall-clock measurement of the fused forward pass with branchless SIMD kernels (M1 Pro, 30 gen tokens, 4-token prompt):
+
+| Metric | Projected (prior) | Measured | Delta |
+|--------|:-----------------:|:--------:|:-----:|
+| **ms/token** | 6.6 | **16.9** | 2.6× slower |
+| **tok/s** | 150 | **59** | 2.5× less |
+| **Total GPU time (24 layers + logits)** | — | **~16.1 ms** | — |
+
+**Measured per-layer GPU time** (via `--perf` per-layer CB timing, steady-state):
+
+| Layer CBs (24) | logits CB |
+|:--------------:|:---------:|
+| ~650 μs each | ~530 μs |
+
+**Why the projection was off by 2.6×:**
+
+1. **Sequential execution within a layer**: The projection assumed matmuls within a layer run in parallel on the 16-core GPU. In reality, all ~20 dispatches per layer are **data-dependent and execute sequentially** — Q depends on RMS norm, attn_out depends on attention, ffn_down depends on gate*up, etc. The GPU sequences them within a single command buffer.
+
+2. **Unmeasured ops**: Norms (2×), bias adds (3×), rope (2×), silu, residual adds (2×), KV cache writes (2×), copy (2×), and attention contribute ~300μs/layer beyond the 7 matmuls.
+
+3. **GPU warmup**: First 3-4 tokens at ~1000μs/layer (old speed), steady state at ~650μs/layer after ~12 dispatches.
+
+### Historical Projection: How 6.6ms Was Calculated
+
+The 6.6ms figure was derived from three measured per-op GPU timestamps (`--perf-granular` GPUStartTime/GPUEndTime), then projected to wall-clock:
+
+| Per-layer matmul | Dims | GPU time (measured) | Raw sum (24 layers) |
+|-----------------|:----:|:-------------------:|:-------------------:|
+| Q, K, V (×3) | 896×896 | 67 μs each | 24 × 67 μs = 1.6 ms |
+| attn_out | 896×896 | 67 μs | 24 × 67 μs = 1.6 ms |
+| gate, up (×2) | 4864×896 | 170 μs each | 24 × 170 μs = 4.1 ms |
+| down | 896×4864 | 170 μs | 24 × 170 μs = 4.1 ms |
+| Unmeasured overhead (est.) | — | ~1-2 ms | ~1.5 ms |
+| **Raw sum** | | | **~13 ms** |
+
+Then the projection assumed aggressive GPU overlap, estimating that matmuls within each layer run in parallel on 16 cores (QKV overlapping, gate+up overlapping, gate and down overlapping), cutting the per-layer sum from ~778μs to ~276μs:
+
+| Assumption | Raw per-layer sum | With overlap | Rationale |
+|-----------|:-----------------:|:------------:|-----------|
+| QKV fuse | 67 + 67 + 67 | ~67 μs | 3 matmuls of same size, different outputs |
+| gate+up parallel | 170 + 170 | ~170 μs | Same input (scratch), different weights |
+| gate overlaps down | 170 + 170 | ~170 μs | Independent layers (gate reads scratch, down reads gate_up) |
+
+The overlap assumption was wrong: all dispatches within a single command buffer execute sequentially on Apple GPU compute encoders because each op reads the previous op's output. The 650μs/layer measured by `--perf` showed that no meaningful overlap occurs.
+
+### Warmup Profile
+
+Both per-op GPU timestamps and per-layer CB timing show significant warmup on cold GPU. The first few tokens run at ~pre-optimization speed, stabilizing after ~12 dispatches:
+
+| Pass | ffn_gate (measured per-op) | Per-layer CB (measured) |
+|:----:|:--------------------------:|:-----------------------:|
+| Cold | 552 μs | ~1000 μs |
+| 3    | 333 μs | ~900 μs |
+| 5    | 278 μs | ~800 μs |
+| 7    | 224 μs | ~700 μs |
+| 12+  | **170 μs** | **~650 μs** |
+
+This warmup is GPU instruction/cache warmup — branchless code gets cached in the GPU's instruction cache, and the SIMD pipeline fills optimally after a few dispatches. It affects both per-op and per-wall-clock measurements, so benchmark runs should use at least 12 tokens for stable data.
+
+**To reproduce:**
+```bash
+./tmac_gguf ~/fpga/models/model.tmac --metal-fused --generate 30 < tokens.txt
+# Look for: [BENCH] Generated 30 tokens in X.X ms — Y.Y ms/tok, Z tok/s
+
+# Per-layer breakdown:
+./tmac_gguf ~/fpga/models/model.tmac --metal-fused --perf --generate 30 < tokens.txt
+# Look for: [GPU PER-CB TIMING] section
+```
 
 ### Why Threadgroup Caching Didn't Help (Investigated, Rejected)
 Hypothesis: 32-lane × 22-byte-block reads cause 32× read amplification. Reality: Apple GPU hardware coalesces identical-address reads within a SIMD group, so all 32 lanes reading `base+6+pos` (where pos varies) generate 16 unique byte-address requests — not 32. Adding a threadgroup cache only added barrier overhead, regressing 19-27%.
@@ -331,14 +394,15 @@ Replaced the three-pass attention kernel (compute scores → softmax → V weigh
 - Identical tokens (9616, 9616, 79152) across CPU, non-fused Metal, and fused Metal paths
 
 ### Performance Impact (M1 Pro, seq_len≤256)
-| Metric | Before (3-pass) | After (flash) | Change |
-|--------|:---------------:|:-------------:|:------:|
-| Non-fused attention time (432 calls) | ~3.5ms | ~3.35ms | ~4% faster |
-| Fused forward_and_logits_fused (avg) | ~20.1ms | ~19.8ms | ~1.5% faster |
-| Fused forward_all_layers_fused (avg) | ~17.8ms | ~18.0ms | ~1% (noise) |
+
+| Metric | Before (3-pass) | After (flash) | Current (branchless SIMD + flash) |
+|--------|:---------------:|:-------------:|:-------------------------------:|
+| Total per-token wall-clock | ~60ms | ~60ms (noise) | **~16.9ms** |
+| Attention contribution (24 layers) | ~3.5ms | ~3.35ms | ~2.9ms (120μs/layer, measured) |
+| Attention share of total | ~6% | ~6% | **~17%** |
 
 ### Why Modest Gain
-At seq_len=256 with HEAD_DIM=64, the attention kernel is only ~3% of total time (quant matmuls dominate at ~60%). The 3-pass kernel at 7.7μs/call was already fast. Flash attention's benefits compound at longer sequences where the KV cache dominates:
+At seq_len=256 with HEAD_DIM=64, the attention kernel is only ~17% of total time (quant matmuls dominate at ~55%). The 3-pass kernel at 7.7μs/call was already fast. Flash attention's benefits compound at longer sequences where the KV cache dominates:
 - Old kernel: O(3 × seq_len) — 3 passes over all positions
 - Flash: O(1 × seq_len) — single pass
 - At seq_len=4096: 3× improvement; at seq_len=8192: 6×+

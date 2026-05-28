@@ -1,5 +1,6 @@
 # Compiled binaries
 tmac_gguf
+tmac_gguf_bench
 tmac_gguf_256
 tmac_gguf_flash
 test_metal
