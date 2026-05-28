@@ -72,7 +72,7 @@ static id<MTLComputeCommandEncoder> g_batch_enc = nil;
 static id<MTLComputePipelineState> g_batch_pipe = nil;
 
 // ── Multi-CB support (commit without wait, then wait-all at end) ──
-static constexpr int MAX_CBS = 32;
+static constexpr int MAX_CBS = 512;
 static id<MTLCommandBuffer> g_committed_cbs[MAX_CBS] = {};
 static const char* g_committed_labels[MAX_CBS] = {};
 static int g_num_committed_cbs = 0;
@@ -129,6 +129,23 @@ inline void metal_batch_commit() {
             g_num_committed_cbs++;
         }
         [g_batch_cb commit];
+        g_batch_cb = nil;
+    }
+}
+
+// Commit current CB and start a new one (for granular profiling)
+inline void metal_batch_checkpoint(void* ctx, const char* name) {
+    Context* c = (Context*)ctx;
+    if (g_batch_enc) { [g_batch_enc endEncoding]; g_batch_enc = nil; g_batch_pipe = nil; }
+    if (g_batch_cb) {
+        [g_batch_cb commit];
+        [g_batch_cb waitUntilCompleted];
+        if (g_trace_enabled && g_cb_count < MAX_CBS) {
+            const char* label = name ? name : g_trace_name;
+            g_cb_labels[g_cb_count] = label;
+            g_cb_ms[g_cb_count] = (g_batch_cb.GPUEndTime - g_batch_cb.GPUStartTime) * 1000.0;
+            g_cb_count++;
+        }
         g_batch_cb = nil;
     }
 }
@@ -384,7 +401,8 @@ kernel void mul_mat_q8_0(device const uint8_t* W [[buffer(0)]],
 }
 
 // ── Q5_0 (SIMD, 64-thread threadgroup, 2 SIMD groups × 2 rows) ──
-// Each lane handles 1 element per 32-element block
+// Each lane handles 1 element per 32-element block.
+// Uses branchless nibble extraction and single 32-bit qh load.
 kernel void mul_mat_q5_0(device const uint8_t* W [[buffer(0)]],
                          device const float* x [[buffer(1)]],
                          device float* y [[buffer(2)]],
@@ -399,16 +417,14 @@ kernel void mul_mat_q5_0(device const uint8_t* W [[buffer(0)]],
     if (first_row >= rows) return;
     int nr = min(2, rows - first_row);
     float sumf[2] = {0.f, 0.f};
-    int lane_half = lane < 16 ? lane : lane - 16;
     for (int ib = 0; ib < nb; ib++) {
         float xv = x[(uint)ib * 32 + lane];
         for (int r = 0; r < nr; r++) {
             ulong base = ((ulong)(first_row + r) * nb + ib) * 22;
             float d = (float)*(device const half*)(W + base);
-            uint qh = (uint)W[base + 2] | ((uint)W[base + 3] << 8)
-                     | ((uint)W[base + 4] << 16) | ((uint)W[base + 5] << 24);
-            uint qs_byte = W[base + 6 + lane_half];
-            uint ql = lane < 16 ? (qs_byte & 0xF) : (qs_byte >> 4);
+            uint qh = *(device const uint32_t*)(W + base + 2);
+            uint qs_byte = W[base + 6 + (lane & 15)];
+            uint ql = (qs_byte >> ((lane >> 4) * 4)) & 0xF;
             int q = (int)((((qh >> lane) & 1) << 4) | ql) - 16;
             sumf[r] += (float)q * d * xv;
         }
@@ -454,19 +470,17 @@ kernel void mul_mat_q4_k(device const uint8_t* W [[buffer(0)]],
             float dmin = (float)*(device const half*)(W + base + 2);
             device const uint8_t* scales = W + base + 4;
             device const uint8_t* qs = W + base + 16;
-            uint sc, m;
-            if (sub < 4) {
-                sc = scales[sub] & 63;  m = scales[sub + 4] & 63;
-            } else {
-                sc = (scales[sub + 4] & 0xF) | ((scales[sub - 4] >> 6) << 4);
-                m  = (scales[sub + 4] >> 4) | ((scales[sub] >> 6) << 4);
-            }
+            uint a = scales[sub];
+            uint b = scales[sub + 4];
+            uint c = scales[(sub - 4) & 7];
+            uint sc = sub < 4 ? (a & 63) : ((b & 0xF) | ((c >> 6) << 4));
+            uint m  = sub < 4 ? (b & 63) : ((b >> 4) | ((a >> 6) << 4));
             float d_sc = d * (float)sc;
             float dmin_m = dmin * (float)m;
             device const uint8_t* qb = qs + byte_base;
             for (int k = 0; k < k_lim; k++) {
                 uint8_t byte = qb[k];
-                uint q4 = (sub & 1) ? (byte >> 4) : (byte & 0xF);
+                uint q4 = (byte >> ((sub & 1) * 4)) & 0xF;
                 sumf[r] += (d_sc * (float)q4 - dmin_m) * xv[k];
             }
         }
@@ -516,7 +530,7 @@ kernel void mul_mat_q6_k(device const uint8_t* W [[buffer(0)]],
             int scale = (int)*(device const int8_t*)(W + base + 192 + hf * 8 + is + sub * 2);
             for (int k = 0; k < k_lim; k++) {
                 uint ql_byte = ql[k];
-                uint ql_nib = (sub < 2) ? (ql_byte & 0xF) : (ql_byte >> 4);
+                uint ql_nib = (ql_byte >> (((sub >> 1) & 1) * 4)) & 0xF;
                 uint qh_bits = (qh[k] >> (sub * 2)) & 0x3;
                 int q6 = (int)((qh_bits << 4) | ql_nib) - 32;
                 sumf[r] += (float)scale * (float)q6 * d * xv[k];
@@ -552,7 +566,6 @@ kernel void kernel_fused_qkv(
     int nr = min(2, total_rows - first_row);
     int nb = cols / 32;
     float sumf[2] = {0.f, 0.f};
-    int lane_half = lane < 16 ? lane : lane - 16;
     for (int ib = 0; ib < nb; ib++) {
         float xv = x[(uint)ib * 32 + lane];
         for (int r = 0; r < nr; r++) {
@@ -569,9 +582,9 @@ kernel void kernel_fused_qkv(
             if (global_row < q_rows + k_rows || v_type == 0) {
                 ulong base = ((ulong)local_row * nb + ib) * 22;
                 float d = (float)*(device const half*)(W + base);
-                uint qh = (uint)W[base+2]|((uint)W[base+3]<<8)|((uint)W[base+4]<<16)|((uint)W[base+5]<<24);
-                uint qs_byte = W[base + 6 + lane_half];
-                uint ql = lane < 16 ? (qs_byte & 0xF) : (qs_byte >> 4);
+                uint qh = *(device const uint32_t*)(W + base + 2);
+                uint qs_byte = W[base + 6 + (lane & 15)];
+                uint ql = (qs_byte >> ((lane >> 4) * 4)) & 0xF;
                 int q = (int)((((qh >> lane) & 1) << 4) | ql) - 16;
                 sumf[r] += (float)q * d * xv;
             } else {
@@ -636,7 +649,7 @@ kernel void kernel_fused_ffn_gate_up(
             int scale = (int)*(device const int8_t*)(W + base + 192 + hf * 8 + is + sub * 2);
             for (int k = 0; k < k_lim; k++) {
                 uint ql_byte = ql[k];
-                uint ql_nib = (sub < 2) ? (ql_byte & 0xF) : (ql_byte >> 4);
+                uint ql_nib = (ql_byte >> (((sub >> 1) & 1) * 4)) & 0xF;
                 uint qh_bits = (qh[k] >> (sub * 2)) & 0x3;
                 int q6 = (int)((qh_bits << 4) | ql_nib) - 32;
                 sumf[r] += (float)scale * (float)q6 * d * xv[k];

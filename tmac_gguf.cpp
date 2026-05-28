@@ -24,6 +24,10 @@ struct TraceEvent {
 
 static std::vector<TraceEvent> g_trace_events;
 static bool g_perf_enabled = false;
+static bool g_perf_granular = false;
+
+namespace metal_backend { struct Context; }
+static metal_backend::Context* g_mtl_ctx_ptr;
 
 static int64_t now_us() {
     auto now = std::chrono::high_resolution_clock::now();
@@ -44,12 +48,34 @@ static void trace_end(const char* name) {
 struct TraceScope {
     const char* name_;
     TraceScope(const char* name) : name_(name) { trace_begin(name_); }
-    ~TraceScope() { trace_end(name_); }
+    ~TraceScope() {
+        if (g_perf_granular && g_mtl_ctx_ptr) {
+            char label[64];
+            snprintf(label, sizeof(label), "%s", name_);
+            metal_backend::metal_batch_checkpoint(g_mtl_ctx_ptr, strdup(label));
+        }
+        trace_end(name_);
+    }
 };
 
 #define PROFILE_SCOPE(name) TraceScope CONCAT(_trace_, __LINE__)(name)
 #define CONCAT_(a, b) a ## b
 #define CONCAT(a, b) CONCAT_(a, b)
+
+struct TraceScopeGPU {
+    const char* name_;
+    TraceScopeGPU(const char* name) : name_(name) {
+        if (!g_perf_granular) return;
+        metal_backend::metal_batch_commit();
+    }
+    ~TraceScopeGPU() {
+        if (!g_perf_granular) return;
+        metal_backend::metal_batch_wait_all();
+        g_trace_events.push_back({name_, now_us(), 'B'});
+        g_trace_events.push_back({name_, now_us(), 'E'});
+    }
+};
+#define PROFILE_SCOPE_GPU(name) TraceScopeGPU CONCAT(_trace_gpu_, __LINE__)(name)
 
 static void dump_chrome_trace(const char* path) {
     if (!g_perf_enabled || g_trace_events.empty()) return;
@@ -1427,6 +1453,7 @@ void forward_all_layers(float* hidden, int pos) {
 // ── Fused all-GPU forward pass (one command buffer, zero CPU sync) ──
 void forward_all_layers_fused(float* hidden, int pos) {
     PROFILE_SCOPE("forward_all_layers_fused");
+    fprintf(stderr, "[PERF] forward_all_layers_fused pos=%d\n", pos);
 
     // Static buffers so wrap_buffer gets stable pointers
     static float scratch[HIDDEN_DIM];
@@ -1439,72 +1466,88 @@ void forward_all_layers_fused(float* hidden, int pos) {
     static float ffn_out[HIDDEN_DIM];
     char name[128];
 
-    metal_backend::metal_batch_begin(g_mtl_ctx);
+    // Per-layer CB when profiling
+    int layer_cb_size = g_perf_enabled ? 1 : NUM_LAYERS;
+    for (int layer_start = 0; layer_start < NUM_LAYERS; layer_start += layer_cb_size) {
+        metal_backend::metal_batch_begin(g_mtl_ctx, layer_start == 0);
 
-    for (int layer = 0; layer < NUM_LAYERS; layer++) {
-        // ── Attention ──
-        // 1. scratch = hidden
-        metal_backend::elem_op(g_mtl_ctx, 2, scratch, hidden, HIDDEN_DIM);
-        // 2. rmsnorm in-place
-        snprintf(name, 128, "blk.%d.attn_norm.weight", layer);
-        metal_backend::rmsnorm_op(g_mtl_ctx, scratch,
-            (const float*)get_tensor_info(name)->data, HIDDEN_DIM);
-        // 3–5. Q, K, V matmuls
-        snprintf(name, 128, "blk.%d.attn_q.weight", layer);
-        matmul(get_tensor_info(name), scratch, q_vec, HIDDEN_DIM, HIDDEN_DIM);
-        snprintf(name, 128, "blk.%d.attn_k.weight", layer);
-        matmul(get_tensor_info(name), scratch, k_new, K_DIM, HIDDEN_DIM);
-        snprintf(name, 128, "blk.%d.attn_v.weight", layer);
-        matmul(get_tensor_info(name), scratch, v_new, V_DIM, HIDDEN_DIM);
-        // 6–8. bias
-        snprintf(name, 128, "blk.%d.attn_q.bias", layer);
-        Tensor* t = get_tensor_info(name);
-        if (t) metal_backend::elem_op(g_mtl_ctx, 0, q_vec, (const float*)t->data, HIDDEN_DIM);
-        snprintf(name, 128, "blk.%d.attn_k.bias", layer);
-        t = get_tensor_info(name);
-        if (t) metal_backend::elem_op(g_mtl_ctx, 0, k_new, (const float*)t->data, K_DIM);
-        snprintf(name, 128, "blk.%d.attn_v.bias", layer);
-        t = get_tensor_info(name);
-        if (t) metal_backend::elem_op(g_mtl_ctx, 0, v_new, (const float*)t->data, V_DIM);
-        // 9–10. rope
-        metal_backend::rope_op(g_mtl_ctx, q_vec, NUM_HEADS, HEAD_DIM, pos, 1000000.0f);
-        metal_backend::rope_op(g_mtl_ctx, k_new, NUM_KV_HEADS, HEAD_DIM, pos, 1000000.0f);
-        // 11–12. cache write
-        metal_backend::elem_op(g_mtl_ctx, 2, &g_k_cache[layer][pos][0], k_new, K_DIM);
-        metal_backend::elem_op(g_mtl_ctx, 2, &g_v_cache[layer][pos][0], v_new, V_DIM);
-        // 13. attention
-        metal_backend::attention_op(g_mtl_ctx, q_vec,
-            &g_k_cache[layer][0][0], &g_v_cache[layer][0][0],
-            context, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, pos);
-        // 14. attn output matmul
-        snprintf(name, 128, "blk.%d.attn_output.weight", layer);
-        matmul(get_tensor_info(name), context, attn_out, HIDDEN_DIM, HIDDEN_DIM);
-        // 15. residual: hidden += attn_out
-        metal_backend::elem_op(g_mtl_ctx, 0, hidden, attn_out, HIDDEN_DIM);
+        int layer_end = std::min(layer_start + layer_cb_size, NUM_LAYERS);
+        for (int layer = layer_start; layer < layer_end; layer++) {
+            // ── Attention ──
+            metal_backend::g_trace_name = "attn_copy";
+            { PROFILE_SCOPE("L00_copy"); metal_backend::elem_op(g_mtl_ctx, 2, scratch, hidden, HIDDEN_DIM); }
+            metal_backend::g_trace_name = "attn_rms";
+            { PROFILE_SCOPE("L01_attn_norm");
+              snprintf(name, 128, "blk.%d.attn_norm.weight", layer);
+              metal_backend::rmsnorm_op(g_mtl_ctx, scratch, (const float*)get_tensor_info(name)->data, HIDDEN_DIM); }
+            metal_backend::g_trace_name = "attn_q";
+            { PROFILE_SCOPE("L02_attn_q");
+              snprintf(name, 128, "blk.%d.attn_q.weight", layer);
+              matmul(get_tensor_info(name), scratch, q_vec, HIDDEN_DIM, HIDDEN_DIM); }
+            metal_backend::g_trace_name = "attn_k";
+            { PROFILE_SCOPE("L03_attn_k");
+              snprintf(name, 128, "blk.%d.attn_k.weight", layer);
+              matmul(get_tensor_info(name), scratch, k_new, K_DIM, HIDDEN_DIM); }
+            metal_backend::g_trace_name = "attn_v";
+            { PROFILE_SCOPE("L04_attn_v");
+              snprintf(name, 128, "blk.%d.attn_v.weight", layer);
+              matmul(get_tensor_info(name), scratch, v_new, V_DIM, HIDDEN_DIM); }
+            metal_backend::g_trace_name = "attn_bias";
+            { PROFILE_SCOPE("L05_bias");
+              snprintf(name, 128, "blk.%d.attn_q.bias", layer); Tensor* t = get_tensor_info(name);
+              if (t) metal_backend::elem_op(g_mtl_ctx, 0, q_vec, (const float*)t->data, HIDDEN_DIM);
+              snprintf(name, 128, "blk.%d.attn_k.bias", layer); t = get_tensor_info(name);
+              if (t) metal_backend::elem_op(g_mtl_ctx, 0, k_new, (const float*)t->data, K_DIM);
+              snprintf(name, 128, "blk.%d.attn_v.bias", layer); t = get_tensor_info(name);
+              if (t) metal_backend::elem_op(g_mtl_ctx, 0, v_new, (const float*)t->data, V_DIM); }
+            metal_backend::g_trace_name = "rope";
+            { PROFILE_SCOPE("L06_rope");
+              metal_backend::rope_op(g_mtl_ctx, q_vec, NUM_HEADS, HEAD_DIM, pos, 1000000.0f);
+              metal_backend::rope_op(g_mtl_ctx, k_new, NUM_KV_HEADS, HEAD_DIM, pos, 1000000.0f); }
+            metal_backend::g_trace_name = "kv_cache";
+            { PROFILE_SCOPE("L07_cache");
+              metal_backend::elem_op(g_mtl_ctx, 2, &g_k_cache[layer][pos][0], k_new, K_DIM);
+              metal_backend::elem_op(g_mtl_ctx, 2, &g_v_cache[layer][pos][0], v_new, V_DIM); }
+            metal_backend::g_trace_name = "attention";
+            { PROFILE_SCOPE("L08_attention");
+              metal_backend::attention_op(g_mtl_ctx, q_vec, &g_k_cache[layer][0][0], &g_v_cache[layer][0][0], context, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, pos); }
+            metal_backend::g_trace_name = "attn_out";
+            { PROFILE_SCOPE("L09_attn_out");
+              snprintf(name, 128, "blk.%d.attn_output.weight", layer);
+              matmul(get_tensor_info(name), context, attn_out, HIDDEN_DIM, HIDDEN_DIM); }
+            metal_backend::g_trace_name = "residual1";
+            { PROFILE_SCOPE("L10_residual");
+              metal_backend::elem_op(g_mtl_ctx, 0, hidden, attn_out, HIDDEN_DIM); }
 
-        // ── FFN ──
-        // 16. scratch = hidden
-        metal_backend::elem_op(g_mtl_ctx, 2, scratch, hidden, HIDDEN_DIM);
-        // 17. rmsnorm in-place
-        snprintf(name, 128, "blk.%d.ffn_norm.weight", layer);
-        metal_backend::rmsnorm_op(g_mtl_ctx, scratch,
-            (const float*)get_tensor_info(name)->data, HIDDEN_DIM);
-        // 18. gate matmul → gate_up[0..INTER_DIM-1]
-        snprintf(name, 128, "blk.%d.ffn_gate.weight", layer);
-        matmul(get_tensor_info(name), scratch, gate_up, INTER_DIM, HIDDEN_DIM);
-        // 19. up matmul → gate_up[INTER_DIM..]
-        snprintf(name, 128, "blk.%d.ffn_up.weight", layer);
-        matmul(get_tensor_info(name), scratch, gate_up + INTER_DIM, INTER_DIM, HIDDEN_DIM);
-        // 20. silu_x_up in-place on gate_up
-        metal_backend::elem_op(g_mtl_ctx, 1, gate_up, nullptr, INTER_DIM);
-        // 21. down matmul
-        snprintf(name, 128, "blk.%d.ffn_down.weight", layer);
-        matmul(get_tensor_info(name), gate_up, ffn_out, HIDDEN_DIM, INTER_DIM);
-        // 22. residual: hidden += ffn_out
-        metal_backend::elem_op(g_mtl_ctx, 0, hidden, ffn_out, HIDDEN_DIM);
+            // ── FFN ──
+            metal_backend::g_trace_name = "ffn_copy";
+            { PROFILE_SCOPE("L11_ffn_copy"); metal_backend::elem_op(g_mtl_ctx, 2, scratch, hidden, HIDDEN_DIM); }
+            metal_backend::g_trace_name = "ffn_rms";
+            { PROFILE_SCOPE("L12_ffn_norm");
+              snprintf(name, 128, "blk.%d.ffn_norm.weight", layer);
+              metal_backend::rmsnorm_op(g_mtl_ctx, scratch, (const float*)get_tensor_info(name)->data, HIDDEN_DIM); }
+            metal_backend::g_trace_name = "ffn_gate";
+            { PROFILE_SCOPE("L13_ffn_gate");
+              snprintf(name, 128, "blk.%d.ffn_gate.weight", layer);
+              matmul(get_tensor_info(name), scratch, gate_up, INTER_DIM, HIDDEN_DIM); }
+            metal_backend::g_trace_name = "ffn_up";
+            { PROFILE_SCOPE("L14_ffn_up");
+              snprintf(name, 128, "blk.%d.ffn_up.weight", layer);
+              matmul(get_tensor_info(name), scratch, gate_up + INTER_DIM, INTER_DIM, HIDDEN_DIM); }
+            metal_backend::g_trace_name = "silu";
+            { PROFILE_SCOPE("L15_silu");
+              metal_backend::elem_op(g_mtl_ctx, 1, gate_up, nullptr, INTER_DIM); }
+            metal_backend::g_trace_name = "ffn_down";
+            { PROFILE_SCOPE("L16_ffn_down");
+              snprintf(name, 128, "blk.%d.ffn_down.weight", layer);
+              matmul(get_tensor_info(name), gate_up, ffn_out, HIDDEN_DIM, INTER_DIM); }
+            metal_backend::g_trace_name = "residual2";
+            { PROFILE_SCOPE("L17_residual");
+              metal_backend::elem_op(g_mtl_ctx, 0, hidden, ffn_out, HIDDEN_DIM); }
+        }
+
+        metal_backend::metal_batch_end();
     }
-
-    metal_backend::metal_batch_end();
 }
 
 // ── Fused forward + logits (single CB: layers + output norm + embedding matmul) ──
@@ -1524,7 +1567,6 @@ void forward_and_logits_fused(float* hidden, float* logits, int pos) {
     Tensor* emb_t = get_tensor_info("token_embd.weight");
     Tensor* norm_t = get_tensor_info("output_norm.weight");
 
-    if (g_perf_enabled) metal_backend::metal_trace_begin();
     metal_backend::g_params_offset = 0;
 
     // Chunk layers: per-layer profiling when --perf
@@ -1608,10 +1650,6 @@ void forward_and_logits_fused(float* hidden, float* logits, int pos) {
     }
 
     metal_backend::metal_batch_wait_all();
-    if (g_perf_enabled) {
-        metal_backend::metal_trace_end();
-        metal_backend::metal_trace_report();
-    }
 }
 
 int sample_token(float* logits, int top_k) {
@@ -1749,6 +1787,7 @@ int main(int argc, char** argv) {
         if (strcmp(argv[i], "--fpga-q8") == 0) { g_use_fpga = true; g_fpga_q8 = true; }
         if (strcmp(argv[i], "--fpga-q4k") == 0) { g_use_fpga = true; g_fpga_q4k = true; }
         if (strcmp(argv[i], "--perf") == 0) g_perf_enabled = true;
+        if (strcmp(argv[i], "--perf-granular") == 0) { g_perf_enabled = true; g_perf_granular = true; }
         if (strcmp(argv[i], "--gpu-capture") == 0) g_gpu_capture = true;
         if (strcmp(argv[i], "--dump-tiles") == 0 && i + 1 < argc) {
             int n = atoi(argv[++i]);
@@ -1768,6 +1807,7 @@ int main(int argc, char** argv) {
                 printf("[ERROR] Metal init failed\n");
                 return 1;
             }
+            g_mtl_ctx_ptr = &g_mtl_ctx;
         }
         if (strcmp(argv[i], "--metal-fused") == 0) {
             g_use_metal = true;
@@ -1776,6 +1816,7 @@ int main(int argc, char** argv) {
                 printf("[ERROR] Metal init failed\n");
                 return 1;
             }
+            g_mtl_ctx_ptr = &g_mtl_ctx;
         }
     }
 
@@ -1785,6 +1826,7 @@ int main(int argc, char** argv) {
     if (tokens.empty()) { printf("[ERROR] No prompt tokens\n"); return 1; }
 
     {
+        if (g_perf_enabled) metal_backend::metal_trace_begin();
         PROFILE_SCOPE("process_prompt");
         if (process_prompt(hidden, tokens, dump_layers) != 0) return 1;
     }
@@ -1845,6 +1887,10 @@ int main(int argc, char** argv) {
         fpga_sim::g_timing.report();
     }
     if (g_perf_enabled) {
+        if (g_use_metal) {
+            metal_backend::metal_trace_end();
+            metal_backend::metal_trace_report();
+        }
         print_trace_summary();
         dump_chrome_trace("/tmp/pipeline_trace.json");
     }
