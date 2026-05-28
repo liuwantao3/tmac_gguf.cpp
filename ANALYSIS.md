@@ -213,7 +213,7 @@ The fused forward pass already eliminated per-layer sync overhead. The current b
 - Estimated gain: **30-50%** on total GPU time if matmuls are the bottleneck
 
 ### Priority 2: Reduce dispatch count with fused kernels
-**Rationale**: `forward_and_logits_fused` has 3 separate dispatches for FFN (gate matmul + up matmul + silu elem_op). A Q6_K `fused_ffn_gate_up_op` kernel exists and is wired for Q6_K FFN gate/up weights. Qwen2-0.5B uses Q5_0 for FFN gate/up, so a Q5_0 fused kernel is being added. Fusing 3 dispatches into 1 eliminates 2 Metal dispatch call overheads per layer.
+**Rationale**: `forward_and_logits_fused` has 3 separate dispatches for FFN (gate matmul + up matmul + silu elem_op). A Q5_0 `fused_ffn_gate_up_op` kernel is wired in both `forward_all_layers_fused` and `forward_and_logits_fused` for Q5_0 FFN gate/up weights. Fusing 3 dispatches into 1 eliminates 2 Metal dispatch call overheads per layer.
 - Estimated gain: **5-10%** on CPU encoding time; enables better GPU pipelining
 
 ### Priority 3: Multi-CB async encoding (GCD dispatch_apply)

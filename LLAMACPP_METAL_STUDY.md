@@ -199,13 +199,13 @@ Two pipelines created at init:
 
 ---
 
-## 4. Fused FFN Gate+Up Matmul — In Progress
+## 4. Fused FFN Gate+Up Matmul — ✅ DONE
 
 **llama.cpp:** `kernel_fused_ffn_silu_gate` — gate+up+silu+down in one kernel.
 
-**Our implementation:** `kernel_fused_ffn_gate_up` at `metal_backend.hpp:609-663` (Q6_K only, gate+up only)
+**Our implementation:** `kernel_fused_ffn_gate_up_q5` at `metal_backend.hpp:609-648` (Q5_0 only, gate+up only)
 
-Currently wired in `forward_and_logits_fused` for Q6_K FFN gate/up weights. However, Qwen2-0.5B uses Q5_0 for FFN gate/up — so a Q5_0 version of the fused kernel is being implemented.
+Wired in `forward_all_layers_fused` for all 24 layers × 24 generation tokens. FFN gate/up are Q5_0 in Qwen2-0.5B.
 
 **Why silu+down can't be fused:**
 - silu needs the FULL gate and up results (not partial sums)
