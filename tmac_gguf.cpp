@@ -1465,8 +1465,9 @@ void forward_all_layers_fused(float* hidden, int pos) {
     static float ffn_out[HIDDEN_DIM];
     char name[128];
 
-    // Per-layer CB when profiling
-    int layer_cb_size = g_perf_enabled ? 1 : NUM_LAYERS;
+    // Per-layer CB when profiling; else split into smaller chunks so commit
+    // overhead (~0.5ms per 4 layers) is hidden behind GPU execution (~2ms per 4 layers).
+    int layer_cb_size = g_perf_enabled ? 1 : 4;
     for (int layer_start = 0; layer_start < NUM_LAYERS; layer_start += layer_cb_size) {
         metal_backend::metal_batch_begin(g_mtl_ctx, layer_start == 0);
 
@@ -1559,8 +1560,10 @@ void forward_all_layers_fused(float* hidden, int pos) {
               metal_backend::elem_op(g_mtl_ctx, 0, hidden, ffn_out, HIDDEN_DIM); }
         }
 
-        metal_backend::metal_batch_end();
+        metal_backend::metal_batch_commit();
     }
+
+    metal_backend::metal_batch_wait_all();
 }
 
 // ── Fused forward + logits (single CB: layers + output norm + embedding matmul) ──
@@ -1582,8 +1585,9 @@ void forward_and_logits_fused(float* hidden, float* logits, int pos) {
 
     metal_backend::g_params_offset = 0;
 
-    // Chunk layers: per-layer profiling when --perf
-    int layer_cb_size = g_perf_enabled ? 1 : NUM_LAYERS;
+    // Chunk layers: per-layer profiling when --perf; else 4 layers/CB so commit
+    // overhead (~0.5ms) is hidden behind GPU execution (~2ms).
+    int layer_cb_size = g_perf_enabled ? 1 : 4;
     for (int layer_start = 0; layer_start < NUM_LAYERS; layer_start += layer_cb_size) {
         metal_backend::metal_batch_begin(g_mtl_ctx, false);
 

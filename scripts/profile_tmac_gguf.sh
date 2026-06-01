@@ -25,7 +25,7 @@ SOURCES="$PROJECT_DIR/tmac_gguf.cpp $FPGA_SIM_DIR/matmul_q8.cpp"
 INCLUDES="-I$FPGA_SIM_DIR"
 FRAMEWORKS="-framework Metal -framework MetalPerformanceShaders -framework Foundation -lobjc"
 
-BINARY="$PROJECT_DIR/tmac_gguf_profiled"
+BINARY="$PROJECT_DIR/tmac_gguf"
 
 TRACE_DIR="$PROJECT_DIR/tmac_gguf_trace"
 rm -rf "$TRACE_DIR"

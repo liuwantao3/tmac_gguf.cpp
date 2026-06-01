@@ -154,13 +154,19 @@ inline void metal_batch_checkpoint(void* ctx, const char* name) {
 
 // Wait for all committed CBs, record GPU timings, and clear the list
 inline void metal_batch_wait_all() {
-    for (int i = 0; i < g_num_committed_cbs; i++) {
-        [g_committed_cbs[i] waitUntilCompleted];
-        if (g_trace_enabled && g_cb_count < MAX_CBS) {
+    // All CBs are serialized on the same queue — waiting on the last one
+    // guarantees all are complete. Skip the loop of per-CB waits.
+    if (g_num_committed_cbs > 0) {
+        [g_committed_cbs[g_num_committed_cbs - 1] waitUntilCompleted];
+    }
+    if (g_trace_enabled) {
+        for (int i = 0; i < g_num_committed_cbs && g_cb_count < MAX_CBS; i++) {
             g_cb_labels[g_cb_count] = g_committed_labels[i];
             g_cb_ms[g_cb_count] = (g_committed_cbs[i].GPUEndTime - g_committed_cbs[i].GPUStartTime) * 1000.0;
             g_cb_count++;
         }
+    }
+    for (int i = 0; i < g_num_committed_cbs; i++) {
         g_committed_cbs[i] = nil;
         g_committed_labels[i] = nullptr;
     }
@@ -282,12 +288,16 @@ inline void metal_batch_dispatch(
     metal_trace_sample();
     if (is_simd) {
         int total = ((rows + 3) / 4) * 64;
+        [g_batch_enc pushDebugGroup:@(g_trace_name)];
         [g_batch_enc dispatchThreads:MTLSizeMake(total, 1, 1)
          threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        [g_batch_enc popDebugGroup];
     } else {
         int tg = std::min(rows, 64);
+        [g_batch_enc pushDebugGroup:@(g_trace_name)];
         [g_batch_enc dispatchThreads:MTLSizeMake(rows, 1, 1)
          threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+        [g_batch_enc popDebugGroup];
     }
     // Standalone call: commit+wait here (batch-active calls rely on caller to end)
     if (!batch_was_active) metal_batch_end();
@@ -1048,8 +1058,10 @@ inline void elem_op(Context& ctx, int op, float* data, const float* aux, int dim
     [g_batch_enc setBuffer:g_params_buf offset:slot atIndex:2];
     metal_trace_sample();
     int total = ((dim + 63) / 64) * 64;
+    [g_batch_enc pushDebugGroup:@(g_trace_name)];
     [g_batch_enc dispatchThreads:MTLSizeMake(total, 1, 1)
      threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+    [g_batch_enc popDebugGroup];
 }
 
 inline void rope_op(Context& ctx, float* data, int n_heads, int head_dim, int pos, float base) {
@@ -1063,8 +1075,10 @@ inline void rope_op(Context& ctx, float* data, int n_heads, int head_dim, int po
     [g_batch_enc setBuffer:g_params_buf offset:slot atIndex:2];
     metal_trace_sample();
     int total = ((n_heads * head_dim / 2 + 63) / 64) * 64;
+    [g_batch_enc pushDebugGroup:@(g_trace_name)];
     [g_batch_enc dispatchThreads:MTLSizeMake(total, 1, 1)
      threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+    [g_batch_enc popDebugGroup];
 }
 
 inline void rmsnorm_op(Context& ctx, float* data, const float* weight, int dim) {
@@ -1154,8 +1168,10 @@ inline void fused_qkv_op(Context& ctx,
     [g_batch_enc setBuffer:g_params_buf offset:slot atIndex:7];
     metal_trace_sample();
     int total = ((q_rows + k_rows + v_rows + 3) / 4) * 64;
+    [g_batch_enc pushDebugGroup:@(g_trace_name)];
     [g_batch_enc dispatchThreads:MTLSizeMake(total, 1, 1)
      threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+    [g_batch_enc popDebugGroup];
 }
 
 inline void fused_ffn_gate_up_op(Context& ctx,
@@ -1178,9 +1194,11 @@ inline void fused_ffn_gate_up_op(Context& ctx,
     [g_batch_enc setBuffer:bufY  offset:0 atIndex:3];
     [g_batch_enc setBuffer:g_params_buf offset:slot atIndex:4];
     metal_trace_sample();
+    [g_batch_enc pushDebugGroup:@(g_trace_name)];
     int total = ((rows_per * 2 + 3) / 4) * 64;
     [g_batch_enc dispatchThreads:MTLSizeMake(total, 1, 1)
      threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+    [g_batch_enc popDebugGroup];
 }
 
 } // namespace metal_backend
