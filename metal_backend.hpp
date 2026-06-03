@@ -289,16 +289,16 @@ inline void metal_batch_dispatch(
     metal_trace_sample();
     if (is_simd) {
         int total = ((rows + 3) / 4) * 64;
-        [g_batch_enc pushDebugGroup:@(g_trace_name)];
+        if (g_trace_name) [g_batch_enc pushDebugGroup:@(g_trace_name)];
         [g_batch_enc dispatchThreads:MTLSizeMake(total, 1, 1)
          threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
-        [g_batch_enc popDebugGroup];
+        if (g_trace_name) [g_batch_enc popDebugGroup];
     } else {
         int tg = std::min(rows, 64);
-        [g_batch_enc pushDebugGroup:@(g_trace_name)];
+        if (g_trace_name) [g_batch_enc pushDebugGroup:@(g_trace_name)];
         [g_batch_enc dispatchThreads:MTLSizeMake(rows, 1, 1)
          threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
-        [g_batch_enc popDebugGroup];
+        if (g_trace_name) [g_batch_enc popDebugGroup];
     }
     // Standalone call: commit+wait here (batch-active calls rely on caller to end)
     if (!batch_was_active) metal_batch_end();
