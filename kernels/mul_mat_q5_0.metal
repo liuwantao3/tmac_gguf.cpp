@@ -23,9 +23,10 @@ kernel void mul_mat_q5_0(
         for (int r = 0; r < nr; r++) {
             ulong base = ((ulong)(first_row + r) * nb + ib) * 22;
             float d = (float)*(device const half*)(W + base);
-            uint qh = *(device const uint32_t*)(W + base + 2);
-            uint qs_byte = W[base + 6 + (lane & 15)];
-            uint ql = (qs_byte >> ((lane >> 4) * 4)) & 0xF;
+            int lane_half = lane < 16 ? lane : lane - 16;
+            uint qh = (uint)W[base+2]|((uint)W[base+3]<<8)|((uint)W[base+4]<<16)|((uint)W[base+5]<<24);
+            uint qs_byte = W[base + 6 + lane_half];
+            uint ql = lane < 16 ? (qs_byte & 0xF) : (qs_byte >> 4);
             int q = (int)((((qh >> lane) & 1) << 4) | ql) - 16;
             sumf[r] += (float)q * d * xv;
         }
