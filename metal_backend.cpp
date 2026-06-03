@@ -35,7 +35,7 @@ bool init(Context& ctx) {
 
     ctx.pipe_fp32 = get_pipe("mul_mat_fp32", "kernels/mul_mat_fp32.metal");
     ctx.pipe_q8_0 = get_pipe("mul_mat_q8_0", "kernels/mul_mat_q8_0.metal");
-    ctx.pipe_q8_0_simd = nil; // DISABLED: simdgroup_multiply_accumulate returns zero on M1 Pro
+    ctx.pipe_q8_0_simd = nil; // DISABLED: simd kernel needs more debugging
     ctx.pipe_q5_0 = get_pipe("mul_mat_q5_0", "kernels/mul_mat_q5_0.metal");
     ctx.pipe_q4_k = get_pipe("mul_mat_q4_k", "kernels/mul_mat_q4_k.metal");
     ctx.pipe_q6_k = get_pipe("mul_mat_q6_k", "kernels/mul_mat_q6_k.metal");
@@ -77,7 +77,7 @@ bool init(Context& ctx) {
     ctx.pipe_fused_ffn_gate_up_q5 = get_pipe("kernel_fused_ffn_gate_up_q5", "kernels/kernel_fused_ffn_gate_up_q5.metal");
     ctx.pipe_rope = get_pipe("kernel_rope", "kernels/kernel_rope.metal");
     ctx.pipe_attn = get_pipe("kernel_attn", "kernels/kernel_attn.metal");
-    ctx.pipe_flash_attn = nil; // DISABLED: tmp[8] overflow
+    ctx.pipe_flash_attn = get_pipe("kernel_flash_attn", "kernels/kernel_flash_attn.metal");
     ctx.pipe_rmsnorm = get_pipe("kernel_rmsnorm", "kernels/kernel_rmsnorm.metal");
     if (!ctx.pipe_rope || !ctx.pipe_attn || !ctx.pipe_rmsnorm) return false;
 

@@ -231,18 +231,19 @@ inline void metal_batch_dispatch_simd(
         g_params_buf = [ctx.device newBufferWithLength:PARAMS_POOL_SIZE
                          options:MTLStorageModeShared];
     int slot = batch_was_active ? g_params_offset : 0;
-    if (batch_was_active) g_params_offset += 8;
+    if (batch_was_active) g_params_offset += 12;
     int* params = (int*)((uint8_t*)[g_params_buf contents] + slot);
     params[0] = rows;
     params[1] = cols;
+    params[2] = 0; // debug_mode = 0 (disabled)
 
     [g_batch_enc setBuffer:bufW offset:0 atIndex:0];
     [g_batch_enc setBuffer:bufX offset:0 atIndex:1];
     [g_batch_enc setBuffer:bufY offset:0 atIndex:2];
     [g_batch_enc setBuffer:g_params_buf offset:slot atIndex:3];
 
-    [g_batch_enc dispatchThreads:MTLSizeMake(tg_x, tg_y, tg_z)
-             threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+    [g_batch_enc dispatchThreadgroups:MTLSizeMake(tg_x, tg_y, tg_z)
+             threadsPerThreadgroup:MTLSizeMake(32, 2, 1)];
 }
 
 inline void metal_batch_dispatch(
@@ -411,7 +412,7 @@ inline void rmsnorm_op(Context& ctx, float* data, const float* weight, int dim) 
 inline void attention_op(Context& ctx,
                          const float* Q, const float* K_cache, const float* V_cache,
                          float* output, int n_head, int n_kv_head, int head_dim, int past_len) {
-    static bool use_flash_attn = false; // DISABLED: tmp[8] overflow
+    static bool use_flash_attn = false; // DISABLED: GQA head allocation broken
     if (use_flash_attn && ctx.pipe_flash_attn && head_dim == 64) {
         metal_batch_ensure_encoder(ctx, ctx.pipe_flash_attn);
         id<MTLBuffer> buf_Q = wrap_buffer(ctx, Q, (size_t)n_head * head_dim * 4);

@@ -89,7 +89,7 @@ kernel void kernel_flash_attn(
                     simdgroup_multiply_accumulate(mqk, mq, mk, mqk);
                 }
 
-                threadgroup float tmp[8];
+                threadgroup float tmp[64];
                 simdgroup_store(mqk, tmp, 8);
                 float sum = 0;
                 for (int i = 0; i < 8; i++) sum += tmp[i];
