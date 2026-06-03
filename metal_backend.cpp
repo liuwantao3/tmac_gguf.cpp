@@ -24,66 +24,67 @@ bool init(Context& ctx) {
     ctx.queue = [ctx.device newCommandQueue];
     if (!ctx.queue) { printf("[METAL] No command queue\n"); return false; }
 
-    auto get_pipe = [&](const char* name, const char* file) -> id<MTLComputePipelineState> {
-        id<MTLLibrary> lib = load_metal_source(ctx, file);
-        if (!lib) return nil;
+    id<MTLLibrary> lib = load_metal_source(ctx, "kernels/all_kernels.metal");
+    if (!lib) return false;
+
+    auto get_fn = [&](const char* name) -> id<MTLFunction> {
         NSError* err = nil;
         id<MTLFunction> fn = [lib newFunctionWithName:@(name)];
-        if (!fn) { printf("[METAL] No function: %s\n", name); return nil; }
+        if (!fn) printf("[METAL] No function: %s\n", name);
+        return fn;
+    };
+    auto make_pipe = [&](id<MTLFunction> fn) -> id<MTLComputePipelineState> {
+        if (!fn) return nil;
+        NSError* err = nil;
         id<MTLComputePipelineState> p = [ctx.device newComputePipelineStateWithFunction:fn error:&err];
-        if (err) { printf("[METAL] Pipeline %s: %s\n", name, [[err localizedDescription] UTF8String]); return nil; }
+        if (err) printf("[METAL] Pipeline: %s\n", [[err localizedDescription] UTF8String]);
         return p;
     };
 
-    ctx.pipe_fp32 = get_pipe("mul_mat_fp32", "kernels/mul_mat_fp32.metal");
-    ctx.pipe_q8_0 = get_pipe("mul_mat_q8_0", "kernels/mul_mat_q8_0.metal");
-    ctx.pipe_q8_0_simd = get_pipe("mul_mat_q8_0_simd", "kernels/mul_mat_q8_0_simd.metal");
-    if (ctx.pipe_q8_0_simd) printf("[METAL] Using simdgroup Q8_0 kernel\n");
-    ctx.pipe_q5_0 = get_pipe("mul_mat_q5_0", "kernels/mul_mat_q5_0.metal");
-    ctx.pipe_q4_k = get_pipe("mul_mat_q4_k", "kernels/mul_mat_q4_k.metal");
-    ctx.pipe_q6_k = get_pipe("mul_mat_q6_k", "kernels/mul_mat_q6_k.metal");
+    ctx.pipe_fp32 = make_pipe(get_fn("mul_mat_fp32"));
+    ctx.pipe_q8_0 = make_pipe(get_fn("mul_mat_q8_0"));
+    ctx.pipe_q8_0_simd = nil; // DISABLED
+    ctx.pipe_q5_0 = make_pipe(get_fn("mul_mat_q5_0"));
+    ctx.pipe_q4_k = make_pipe(get_fn("mul_mat_q4_k"));
+    ctx.pipe_q6_k = make_pipe(get_fn("mul_mat_q6_k"));
     if (!ctx.pipe_q5_0 || !ctx.pipe_q4_k || !ctx.pipe_q6_k) return false;
 
     {
-        id<MTLLibrary> lib = load_metal_source(ctx, "kernels/kernel_elem.metal");
-        if (!lib) return false;
         MTLFunctionConstantValues* cv = [MTLFunctionConstantValues new];
-        auto make_pipe = [&](int op_val) -> id<MTLComputePipelineState> {
+        auto make_elem = [&](int op_val) -> id<MTLComputePipelineState> {
             NSError* err = nil;
             [cv setConstantValue:&op_val type:MTLDataTypeInt atIndex:0];
             id<MTLFunction> fn = [lib newFunctionWithName:@"kernel_elem"
                                    constantValues:cv error:&err];
-            if (err) { printf("[METAL] kernel_elem(%d): %s\n", op_val, [[err localizedDescription] UTF8String]); return nil; }
+            if (!fn) { printf("[METAL] kernel_elem(%d): %s\n", op_val, [[err localizedDescription] UTF8String]); return nil; }
             return [ctx.device newComputePipelineStateWithFunction:fn error:&err];
         };
-        ctx.pipe_elem_add  = make_pipe(0);
-        ctx.pipe_elem_silu = make_pipe(1);
-        ctx.pipe_elem_write = make_pipe(2);
+        ctx.pipe_elem_add  = make_elem(0);
+        ctx.pipe_elem_silu = make_elem(1);
+        ctx.pipe_elem_write = make_elem(2);
         if (!ctx.pipe_elem_add || !ctx.pipe_elem_silu || !ctx.pipe_elem_write) return false;
     }
     {
-        id<MTLLibrary> lib = load_metal_source(ctx, "kernels/kernel_fused_qkv.metal");
-        if (!lib) return false;
         MTLFunctionConstantValues* cv = [MTLFunctionConstantValues new];
         auto make_qkv = [&](int v) -> id<MTLComputePipelineState> {
             NSError* err = nil;
             [cv setConstantValue:&v type:MTLDataTypeInt atIndex:1];
             id<MTLFunction> fn = [lib newFunctionWithName:@"kernel_fused_qkv"
                                    constantValues:cv error:&err];
-            if (err) { printf("[METAL] fused_qkv(%d): %s\n", v, [[err description] UTF8String]); return nil; }
+            if (!fn) { printf("[METAL] fused_qkv(%d): %s\n", v, [[err description] UTF8String]); return nil; }
             return [ctx.device newComputePipelineStateWithFunction:fn error:&err];
         };
         ctx.pipe_fused_qkv_q5 = make_qkv(0);
         ctx.pipe_fused_qkv_q8 = make_qkv(1);
         if (!ctx.pipe_fused_qkv_q5 || !ctx.pipe_fused_qkv_q8) return false;
     }
-    ctx.pipe_fused_ffn_gate_up_q5 = get_pipe("kernel_fused_ffn_gate_up_q5", "kernels/kernel_fused_ffn_gate_up_q5.metal");
-    if (!ctx.pipe_fused_ffn_gate_up_q5) return false;
-    ctx.pipe_rope = get_pipe("kernel_rope", "kernels/kernel_rope.metal");
-    ctx.pipe_attn = get_pipe("kernel_attn", "kernels/kernel_attn.metal");
-    ctx.pipe_flash_attn = get_pipe("kernel_flash_attn", "kernels/kernel_flash_attn.metal");
-    ctx.pipe_rmsnorm = get_pipe("kernel_rmsnorm", "kernels/kernel_rmsnorm.metal");
-    if (!ctx.pipe_rope || !ctx.pipe_attn || !ctx.pipe_flash_attn || !ctx.pipe_rmsnorm) return false;
+    ctx.pipe_fused_ffn_gate_up_q5 = make_pipe(get_fn("kernel_fused_ffn_gate_up_q5"));
+    if (!ctx.pipe_fused_ffn_gate_up_q5) printf("[METAL] No fused_ffn_gate_up_q5 (OK)\n");
+    ctx.pipe_rope = make_pipe(get_fn("kernel_rope"));
+    ctx.pipe_attn = make_pipe(get_fn("kernel_attn"));
+    ctx.pipe_flash_attn = nil; // DISABLED
+    ctx.pipe_rmsnorm = make_pipe(get_fn("kernel_rmsnorm"));
+    if (!ctx.pipe_rope || !ctx.pipe_attn || !ctx.pipe_rmsnorm) return false;
 
     ctx.initialized = true;
     printf("[METAL] Device: %s\n", [[ctx.device name] UTF8String]);

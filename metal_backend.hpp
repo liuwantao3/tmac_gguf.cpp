@@ -411,7 +411,7 @@ inline void rmsnorm_op(Context& ctx, float* data, const float* weight, int dim) 
 inline void attention_op(Context& ctx,
                          const float* Q, const float* K_cache, const float* V_cache,
                          float* output, int n_head, int n_kv_head, int head_dim, int past_len) {
-    static bool use_flash_attn = true;
+    static bool use_flash_attn = false; // DISABLED: tmp[8] overflow
     if (use_flash_attn && ctx.pipe_flash_attn && head_dim == 64) {
         metal_batch_ensure_encoder(ctx, ctx.pipe_flash_attn);
         id<MTLBuffer> buf_Q = wrap_buffer(ctx, Q, (size_t)n_head * head_dim * 4);
