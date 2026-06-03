@@ -26,7 +26,6 @@ static std::vector<TraceEvent> g_trace_events;
 static bool g_perf_enabled = false;
 static bool g_perf_granular = false;
 
-namespace metal_backend { struct Context; }
 static metal_backend::Context* g_mtl_ctx_ptr;
 
 static int64_t now_us() {
