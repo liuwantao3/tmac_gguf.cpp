@@ -319,9 +319,8 @@ inline void matmul_q8_0(Context& ctx, int rows, int cols,
                         const uint8_t* w, const float* x, float* y) {
     // Prefer simd kernel if available
     if (ctx.pipe_q8_0_simd) {
-        int nb = cols / 32;
-        int tg_x = (nb + 15) / 16;
-        int tg_y = (rows + 7) / 8;
+        int tg_y = (rows + 3) / 4; // 4 rows per threadgroup
+        int tg_x = 1; // single K-dim group (kernel loops all blocks)
         size_t wb = ((size_t)rows * cols + 31) / 32 * 34;
         metal_batch_dispatch_simd(ctx, ctx.pipe_q8_0_simd, tg_x, tg_y, 1, rows, cols, w, wb, x, y);
     } else {

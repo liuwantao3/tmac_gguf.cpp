@@ -35,7 +35,7 @@ bool init(Context& ctx) {
 
     ctx.pipe_fp32 = get_pipe("mul_mat_fp32", "kernels/mul_mat_fp32.metal");
     ctx.pipe_q8_0 = get_pipe("mul_mat_q8_0", "kernels/mul_mat_q8_0.metal");
-    ctx.pipe_q8_0_simd = nil; // DISABLED: simd kernel needs more debugging
+    ctx.pipe_q8_0_simd = nil; // SIMD kernel passes standalone tests but fails in batch context
     ctx.pipe_q5_0 = get_pipe("mul_mat_q5_0", "kernels/mul_mat_q5_0.metal");
     ctx.pipe_q4_k = get_pipe("mul_mat_q4_k", "kernels/mul_mat_q4_k.metal");
     ctx.pipe_q6_k = get_pipe("mul_mat_q6_k", "kernels/mul_mat_q6_k.metal");
