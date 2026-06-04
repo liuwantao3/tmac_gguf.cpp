@@ -1,137 +1,111 @@
 # tmac_gguf.cpp — Metal GPU-Accelerated Qwen2-0.5B Inference
 
-A high-performance Metal GPU inference engine for Qwen2-0.5B-Instruct, inspired by [llama.cpp](https://github.com/ggerganov/llama.cpp). Built to explore GPU optimization techniques that can inform an FPGA accelerator in a companion project (`~/fpga`).
+High-performance inference engine for Qwen2-0.5B-Instruct on Apple Silicon Metal GPU, with companion FPGA accelerator (`~/fpga`).
 
-## Purpose
-
-This project serves as a **performance optimization playground** for model inference:
-
-1. **Exercise Metal GPU optimization** — implement and benchmark techniques from llama.cpp on Apple Silicon
-2. **Validate against a reference** — ensure correctness via CPU baseline before optimizing
-3. **Collect insights for FPGA** — the techniques developed here inform the hardware-software co-design in `~/fpga`
-
-The companion FPGA project (`~/fpga`) implements a Zynq 7010 accelerator with Verilog RTL. The quantization formats (Q5_0, Q6_K, Q8_0, Q4_K) and matmul patterns here mirror what the FPGA needs to support.
-
-## Model
-
-**Qwen2-0.5B-Instruct** — 24 layers, 896 hidden dim, 14 heads (GQA with 2 KV heads), 64 head dim.
-
-Quantized formats used:
-- **Q5_0**: attention Q/K/V weights
-- **Q5_0**: attention Q/K/V weights, FFN gate/up weights
-- **Q6_K**: FFN down weights (half of layers, 896 × 4864)
-- **Q4_K**: attention output projection, FFN down weights (half of layers)
-- **Q4_K**: attention output projection
-- **Q8_0**: token embeddings, output projection
-
-## Features
-
-- [x] 5 quantization types (Q5_0, Q6_K, Q8_0, Q4_K)
-- [x] KV-cached autoregressive generation
-- [x] Metal GPU acceleration with command buffer batching
-- [x] **Fused QKV matmul** — single dispatch computes Q, K, V together (~6% speedup)
-- [x] Chrome trace profiling (`--perf`)
-- [x] CPU fallback path (verifies correctness)
-- [x] **Fused FFN gate+up matmul** — single dispatch for Q5_0 gate+up (FFN gate/up are Q5_0 in Qwen2-0.5B)
-- [ ] Flash attention (studied but not implemented)
-
-## Build
+## Quick Start
 
 ```bash
-# Requires linking matmul_q8.cpp from ~/fpga/sim (provides logits projection)
-clang++ -std=c++17 -x objective-c++ -O3 \
-    tmac_gguf.cpp \
+# Build (requires ~/fpga/sim for logits projection)
+clang++ -std=c++17 -x objective-c++ -O3 tmac_gguf.cpp metal_backend.cpp \
     ~/fpga/sim/matmul_q8.cpp \
     -framework Foundation -framework Metal -fobjc-arc \
-    -I~/fpga/sim \
-    -o tmac_gguf
+    -I~/fpga/sim -o tmac_gguf
+
+# Run
+echo "0 1 2 3" | ./tmac_gguf model.tmac --metal-fused --generate 30
 ```
 
-## Run
+## Run Modes
 
-```bash
-# CPU baseline
-./tmac_gguf model.tmac --generate 20 < tokens.txt
+| Flag | Path | Sync Points | Speed |
+|------|------|:-----------:|:-----:|
+| `--metal` | Per-layer CB (4 CBs/layer) | 96 commit+wait | ~71 ms/tok |
+| `--metal-fused` | **Single CB for all layers** | **1 commit+wait** | **~17 ms/tok** |
+| `--fpga-q8` | CPU FPGA simulation (INT8) | — | Slow |
+| (none) | CPU matmul | — | ~2.9 s/tok |
 
-# Metal with per-layer sync (4 command buffers per layer)
-./tmac_gguf model.tmac --metal --generate 20 < tokens.txt
+### Profiling Flags
 
-# Metal fused path (1 command buffer for entire forward pass) — RECOMMENDED
-./tmac_gguf model.tmac --metal-fused --generate 20 < tokens.txt
+| Flag | Effect | Overhead |
+|------|--------|:--------:|
+| `--perf` | Chrome trace + per-layer CB timing | ~15-40% |
+| `--perf-granular` | Per-op GPU timing via GPUStartTime/GPUEndTime | ~2-5× |
+| `--gpu-capture` | Xcode GPU frame capture | Minimal |
 
-# With profiling
-./tmac_gguf model.tmac --metal-fused --generate 20 --perf < tokens.txt
-```
+## Model: Qwen2-0.5B-Instruct
 
-## Performance
+| Parameter | Value |
+|-----------|-------|
+| Layers | 24 |
+| Hidden dim | 896 |
+| Query heads | 14 |
+| KV heads (GQA) | 2 |
+| Head dim | 64 |
+| FFN intermediate | 4864 |
+| Vocab | 151936 |
+| Max seq len | 256 |
 
-Single-token generation latency on M1 Pro:
+### Quantization Mix (all tensors converted to Q8_0 at load time)
 
-| Path | ms/token | Notes |
-|------|----------|-------|
-| CPU | ~21ms | 24 layers × 4 CPU sync points |
-| Metal (per-layer) | ~19ms | 4 CBs/layer × 24 layers |
-| Metal (fused QKV) | ~18ms | 1 CB, saves 48 dispatches |
+| Original Type | Count | Usage |
+|:------------:|:-----:|-------|
+| Q5_0 | 132 | QKV projections, FFN gate/up |
+| Q4_K | 12 | Attention output, FFN down (half) |
+| Q6_K | 12 | FFN down (half) |
+| Q8_0 | 13 | Token embeddings, output projection |
+| F32 | 121 | Norm weights, bias |
 
-The fused QKV path saves 2 dispatch operations per layer (Q, K, V matmuls → 1 fused dispatch).
+## Metal Kernels
 
-## Architecture
-
-### Metal Kernels
-
-Each quantization type has a specialized SIMD matmul kernel using 64-thread threadgroups (2 SIMD groups × 32 lanes):
-
-| Kernel | Quantization | Notes |
-|--------|-------------|-------|
-| `mul_mat_q8_0` | Q8_0 | 34 bytes/block, 32 elements |
-| `mul_mat_q5_0` | Q5_0 | 22 bytes/block, 32 elements |
-| `mul_mat_q4_k` | Q4_K | Blocked, 2×16 sub-blocks |
-| `mul_mat_q6_k` | Q6_K | 210 bytes/block, 256 elements |
-| `kernel_rope` | — | In-place rotary embedding |
-| `kernel_rmsnorm` | — | RMS normalization |
-| `kernel_attn` | — | GQA attention with softmax |
-| `kernel_elem` | — | Add, SiLU×up, cache-write |
+| Kernel | Type | Description |
+|--------|------|-------------|
+| `mul_mat_q8_0` | Q8_0 | Scalar matvec, 4 rows/TG, 64 threads |
+| `mul_mat_q8_0_simd` | Q8_0 | simd_sum-based (standalone test only) |
+| `mul_mat_q8_0_simdtc` | Q8_0 | **simdgroup_float8x8 tensor core**, 8 rows/TG |
+| `mul_mat_q5_0` | Q5_0 | Branchless nibble extraction |
+| `mul_mat_q4_k` | Q4_K | 256-element blocked, branchless |
+| `mul_mat_q6_k` | Q6_K | 256-element blocked |
 | `kernel_fused_qkv` | Q5_0/Q8_0 | Fused Q+K+V matmul |
+| `kernel_attn` | — | GQA attention, online softmax, 1 head/TG |
+| `kernel_flash_attn` | — | **Flash attention**, GQA-correct, 8 heads/TG |
+| `kernel_rope` | — | Rotary position embedding |
+| `kernel_rmsnorm` | — | RMS normalization |
+| `kernel_elem` | — | Add, SiLU×up, cache-write |
 
-### Command Buffer Batching
+## Performance (M1 Pro, fused path, 30 gen tokens)
 
-Two modes:
+| Metric | Value |
+|--------|:-----:|
+| **Per-token wall-clock** | **16.9 ms** |
+| **Throughput** | **59 tok/s** |
+| GPU time (24 layers) | ~15.6 ms (~650 μs/layer) |
+| Logits matmul (151936×896) | ~530 μs |
+| CPU encoding overhead | ~0.8 ms |
 
-1. **Per-layer sync** (`--metal`): 4 command buffers per layer, CPU sync after each
-2. **Fused path** (`--metal-fused`): 1 command buffer for entire forward pass, zero CPU sync
-
-## Insights for FPGA Accelerator
-
-Key optimization techniques from this project applicable to `~/fpga`:
-
-1. **Fused operations** — combining multiple independent matmuls reduces protocol overhead
-   - On GPU: dispatch overhead ~30µs per kernel
-   - On FPGA: AXI transaction setup similarly costs cycles
-
-2. **Quantization diversity** — the model uses 4+ quantization types; the FPGA supports only Q8_0 and Q4_K
-   - Missing: Q5_0 (attention Q/K/V), Q6_K (FFN gate/up)
-   - These are the largest layers and biggest performance opportunities
-
-3. **Batch dispatch** — encoding multiple operations into one batch reduces per-op overhead
-   - GPU: one command buffer vs. 96 commit/wait cycles
-   - FPGA: similar gains from batching AXI transactions
-
-4. **Memory layout** — Q6_K uses 256-element blocks (matching GPU SIMD width); FPGA memory access patterns should align to bus width
+**Bottleneck**: GPU compute throughput (~12% bandwidth utilization). Within each layer, ~21 dispatches execute sequentially due to data dependencies.
 
 ## Project Structure
 
 ```
 tmac_gguf.cpp          — Main inference engine
-metal_backend.hpp      — Metal kernels + dispatch helpers (embedded MSL source)
-fpga_sim.hpp           — Symlink to ~/fpga/sim/fpga_sim.hpp
-DESIGN.md              — Detailed design document
-LLAMACPP_METAL_STUDY.md — Analysis of llama.cpp techniques
-FLOW.md                — Forward pass data flow
-ANALYSIS.md            — Performance analysis
+metal_backend.cpp      — Metal init + pipeline loading
+metal_backend.hpp      — Dispatch helpers, batch infrastructure
+kernels/               — 15 Metal Shading Language kernel files
+  mul_mat_q8_0.metal   — Scalar Q8 matvec
+  mul_mat_q8_0_simd.metal      — simd_sum Q8 (reference)
+  mul_mat_q8_0_simdtc.metal    — Tensor core Q8 (production)
+  mul_mat_q5_0.metal, mul_mat_q4_k.metal, mul_mat_q6_k.metal
+  kernel_flash_attn.metal, kernel_attn.metal
+  kernel_fused_qkv.metal, kernel_elem.metal, ...
+test_*.mm              — Standalone test programs (kernel validation)
+scripts/               — TMAC converter, profiling script
+ARCHITECTURE.md        — Design, execution flow, kernel internals
+BENCHMARKS.md          — Performance data, profiling methodology
+LLAMACPP_METAL_STUDY.md — Comparative analysis vs llama.cpp
 ```
 
 ## References
 
 - [llama.cpp](https://github.com/ggerganov/llama.cpp) — inspiration for quantization formats and Metal backend
 - [Qwen2-0.5B](https://huggingface.co/Qwen/Qwen2-0.5B-Instruct) — model architecture
-- `~/fpga` — companion FPGA accelerator project with Verilog RTL implementation
+- `~/fpga` — companion FPGA accelerator with Verilog RTL

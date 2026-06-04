@@ -21,25 +21,25 @@ llama.cpp's Metal backend has 212+ Flash Attention kernel variants for ALL these
 | Optimization | llama.cpp | Our tmac_gguf.cpp | Status |
 |-------------|-----------|------------------|--------|
 | Threadgroup sizing | 64 threads | 64 threads for matmul | ✅ Done |
-| **Flash attention** | **TRUE Flash** (212 variants) | **Online softmax only** | ❌ NOT Done |
-| Simdgroup matmul | hardware simdgroup | Added ~8% improvement | ✅ Done |
+| **Flash attention** | **TRUE Flash** (212 variants) | **simd_sum flash (GQA-correct)** | ✅ Done |
+| Simdgroup matmul (Q8_0) | hardware simdgroup | simdgroup_float8x8 tensor core matmul | ✅ Done |
 | Fused QKV matmul | Yes | Yes | ✅ Done |
-| Fused FFN gate+up | Yes | Yes (broken) | ⚠️ Partial |
+| Fused FFN gate+up | Yes | Yes | ✅ Done |
 
-**Current performance:** ~54 tok/s (tmac) vs ~145 tok/s (llama.cpp) = **2.7× gap**
+**Current performance:** ~59 tok/s (tmac) vs ~145 tok/s (llama.cpp) = **2.5× gap**
 
 ---
 
 ## ROOT CAUSE: Attention Algorithm Difference
 
-### What We Had (NOT Flash Attention)
-Our `kernel_attn` uses **online softmax** - incremental tiling approach:
-- Processes KV in tiles of 8
-- Maintains running max and denominator
-- Single-pass, no threadgroup memory
-- This is NOT true Flash Attention - it's a simplified variant
+### What We Have (Flash Attention, GQA-correct)
+Our `kernel_flash_attn` uses **simd_sum-based online softmax** with tile processing:
+- Processes KV in tiles of 16
+- GQA-correct per-head KV mapping (`kv_head = q_idx * n_kv_head / n_head`)
+- 8 heads per threadgroup (64 threads, 2 simdgroups)
+- Single-pass, maintains running max and denominator
 
-### What llama.cpp Has (TRUE Flash Attention)
+### What llama.cpp Has (TRUE Flash Attention, 212 variants)
 llama.cpp's `kernel_flash_attn_ext`:
 - **212+ kernel variants** for different head dimensions (dk32, dk64, dk128, dk256)
 - **Paged KV cache** - handles arbitrary sequence lengths efficiently

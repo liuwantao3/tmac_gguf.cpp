@@ -244,6 +244,8 @@ inline void metal_batch_dispatch_simd(
 
     [g_batch_enc dispatchThreadgroups:MTLSizeMake(tg_x, tg_y, tg_z)
              threadsPerThreadgroup:MTLSizeMake(32, 2, 1)];
+    // Standalone call: commit+wait here (batch-active calls rely on caller to end)
+    if (!batch_was_active) metal_batch_end();
 }
 
 inline void metal_batch_dispatch(
@@ -319,7 +321,7 @@ inline void matmul_q8_0(Context& ctx, int rows, int cols,
                         const uint8_t* w, const float* x, float* y) {
     // Prefer simd kernel if available
     if (ctx.pipe_q8_0_simd) {
-        int tg_y = (rows + 3) / 4; // 4 rows per threadgroup
+        int tg_y = (rows + 7) / 8; // 8 rows per threadgroup (simdgroup tensor core)
         int tg_x = 1; // single K-dim group (kernel loops all blocks)
         size_t wb = ((size_t)rows * cols + 31) / 32 * 34;
         metal_batch_dispatch_simd(ctx, ctx.pipe_q8_0_simd, tg_x, tg_y, 1, rows, cols, w, wb, x, y);
@@ -411,7 +413,7 @@ inline void rmsnorm_op(Context& ctx, float* data, const float* weight, int dim) 
 inline void attention_op(Context& ctx,
                          const float* Q, const float* K_cache, const float* V_cache,
                          float* output, int n_head, int n_kv_head, int head_dim, int past_len) {
-    static bool use_flash_attn = false; // DISABLED: GQA head allocation broken
+    static bool use_flash_attn = true; // GQA head allocation fixed
     if (use_flash_attn && ctx.pipe_flash_attn && head_dim == 64) {
         metal_batch_ensure_encoder(ctx, ctx.pipe_flash_attn);
         id<MTLBuffer> buf_Q = wrap_buffer(ctx, Q, (size_t)n_head * head_dim * 4);
